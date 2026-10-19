@@ -1,0 +1,28 @@
+# stage pod on gmhv: pre-pulls the pinned image, creates hostPath dirs, checks the model, serves as a copy target for the parquet / overlays
+apiVersion: v1
+kind: Pod
+metadata: {name: tpum3-stage-6nw8, namespace: default, labels: {app: tpum3-stage}}
+spec:
+  restartPolicy: Never
+  nodeName: gke-tpu-2e88ab73-6nw8
+  tolerations: [{key: google.com/tpu, operator: Exists, effect: NoSchedule}]
+  volumes:
+  - {name: data, hostPath: {path: /home/verl-colocated, type: DirectoryOrCreate}}
+  - {name: overlay, hostPath: {path: /home/tpu-m3, type: DirectoryOrCreate}}
+  - {name: tmp, hostPath: {path: /tmp, type: Directory}}
+  containers:
+  - name: stage
+    image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated@sha256:cfba89fa6f8d35aef0d70ecd419be26197f77e28681c43df7ad38983e508a53b
+    imagePullPolicy: IfNotPresent
+    resources: {requests: {cpu: "2", memory: 8Gi}, limits: {memory: 16Gi}}
+    volumeMounts:
+    - {name: data, mountPath: /data}
+    - {name: overlay, mountPath: /overlay}
+    - {name: tmp, mountPath: /hosttmp}
+    command: ["bash", "-c"]
+    args:
+    - |
+      set -x; date -u; mkdir -p /data/data/swe /data/tpu-m3 /overlay/plugin /overlay/swe_work /data/logs/tpu-m3
+      ls -la /hosttmp/tunix-models/Qwen3-1.7B 2>&1 | head -5; du -sh /hosttmp/tunix-models/Qwen3-1.7B 2>&1
+      ls /hosttmp | head -20; df -h /hosttmp /data | cat; nproc; free -g | head -2
+      echo STAGED-OK; sleep infinity

@@ -1,0 +1,83 @@
+# rl-pool-controller: polls the verl control actor's /metrics and POSTs /scale.
+# NOT applied by the plugin-dev agent. Namespace default. Image built by Cloud Build (see Dockerfile).
+#
+# The control actor binds rl_pool.control_port (8787) on the Ray HEAD node, so the Service below
+# selects the KubeRay head pod. Adjust the selector labels to the RayCluster name in use
+# (k8s/raycluster-west-swe.yaml -> ray.io/cluster: <name>).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rl-pool-controller
+  namespace: default
+data:
+  CONTROL_URL: "http://rl-pool-control.default.svc.cluster.local:8787"
+  POLL_INTERVAL_S: "15"
+  MIN_STANDALONE: "1"
+  MAX_STANDALONE: "8"
+  IDLE_HI: "0.5"
+  IDLE_LO: "0.15"
+  DWELL_STEPS: "2"
+  MIN_ACTION_INTERVAL_S: "600"
+  MQ_LO_FRAC: "0.8"
+  MQ_HI_FRAC: "0.9"
+  DECISIONS_JSONL: "/var/log/rl-pool/decisions.jsonl"
+  DRY_RUN: "0"
+  HTTP_TIMEOUT_S: "10"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-pool-control
+  namespace: default
+  labels:
+    app: rl-pool-control
+spec:
+  type: ClusterIP
+  selector:
+    ray.io/node-type: head
+    ray.io/cluster: verl-swe        # <- RayCluster name
+  ports:
+    - name: control
+      port: 8787
+      targetPort: 8787
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rl-pool-controller
+  namespace: default
+  labels:
+    app: rl-pool-controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # exactly one decision-maker at a time
+  selector:
+    matchLabels:
+      app: rl-pool-controller
+  template:
+    metadata:
+      labels:
+        app: rl-pool-controller
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: pathways-cpu-pool   # any CPU pool; never a GPU node
+      containers:
+        - name: controller
+          image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/rl-pool-controller:v1
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: rl-pool-controller
+          resources:
+            requests: {cpu: "50m", memory: "64Mi"}
+            limits: {cpu: "200m", memory: "128Mi"}
+          volumeMounts:
+            - name: decisions
+              mountPath: /var/log/rl-pool
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: decisions
+          emptyDir: {}         # swap for a PVC/hostPath to keep the JSONL across restarts

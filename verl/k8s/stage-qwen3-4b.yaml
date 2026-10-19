@@ -1,0 +1,17 @@
+# stage-qwen3-4b.yaml: downloads Qwen/Qwen3-4B from the HF hub into host /tmp/tunix-models/Qwen3-4B on NODE (same convention as the 1.7B staging)
+apiVersion: v1
+kind: Pod
+metadata: {name: tpum3-stage4b-NODE, namespace: default}
+spec:
+  restartPolicy: Never
+  nodeName: FULLNODE
+  tolerations: [{key: google.com/tpu, operator: Exists, effect: NoSchedule}]
+  volumes:
+  - {name: models, hostPath: {path: /tmp/tunix-models, type: DirectoryOrCreate}}
+  containers:
+  - name: s
+    image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated@sha256:a5d418fe2512c6545ab2673e7509a59f6376b1e972aab73fcd0285ada80a268a
+    env: [{name: HF_HUB_OFFLINE, value: "0"}, {name: HF_HUB_ENABLE_HF_TRANSFER, value: "0"}]
+    command: ["python3", "-c", "import time; t=time.time(); from huggingface_hub import snapshot_download; p=snapshot_download('Qwen/Qwen3-4B', local_dir='/models/Qwen3-4B', allow_patterns=['*.json','*.safetensors','*.txt','merges.txt','vocab.json','LICENSE']); import os; print('DONE', p, sorted(os.listdir(p)), round(time.time()-t), 's')"]
+    volumeMounts: [{name: models, mountPath: /models}]
+    resources: {requests: {cpu: "1", memory: 2Gi}}

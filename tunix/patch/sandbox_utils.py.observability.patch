@@ -1,0 +1,10 @@
+--- /Users/aishuk/workspaces/tunix-poc/examples/deepswe/sandbox_utils.py	2026-10-14 15:45:57
++++ /Users/aishuk/workspaces/rl-pool-autoscaler-ops/tunix-deepswe/patch/sandbox_utils.py	2026-10-14 21:05:37
+@@ -774,6 +774,7 @@
+                 namespace=fleet_ns,
+                 node_selector=node_sel,
+                 in_cluster=in_cluster,
++                runtime_class=os.getenv("SANDBOX_RUNTIME_CLASS") or None,
+             )
+         ],
+         "max_concurrent": effective_max_concurrent,

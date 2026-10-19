@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Pod
+metadata: {name: tpum3-tpuprobe-6nw8, namespace: default}
+spec:
+  restartPolicy: Never
+  nodeSelector: {kubernetes.io/hostname: gke-tpu-2e88ab73-6nw8, cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice, cloud.google.com/gke-tpu-topology: "2x4"}
+  tolerations: [{key: google.com/tpu, operator: Exists, effect: NoSchedule}]
+  containers:
+  - name: p
+    image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated@sha256:a5d418fe2512c6545ab2673e7509a59f6376b1e972aab73fcd0285ada80a268a
+    env: [{name: TPU_SKIP_MDS_QUERY, value: "1"}, {name: TPU_LIBRARY_PATH, value: /opt/libtpu/libtpu-0.0.48.dev20260912+nightly.so}]
+    command: ["bash", "-c", "ls -la /dev/vfio/ ; env | grep -E '^TPU_' | sort; python3 -c \"import jax; d=jax.devices(); print('JAX devices', len(d), [str(x) for x in d])\" 2>&1 | tail -5; echo PROBE-DONE"]
+    resources: {limits: {google.com/tpu: "8"}, requests: {google.com/tpu: "8"}}

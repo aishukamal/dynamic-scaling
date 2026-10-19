@@ -1,0 +1,143 @@
+# TPU-M3: four single-host v6e-4 units of the multi-host pool v6e-4x8 (GKE labels topology 4x8 / tpu-v6e-slice; each node has
+# 4 allocatable google.com/tpu). Head (no TPU, num-cpus 0) + trainer worker on 8f4h (Ray resource tpu-group-0: 4); three sampler
+# workers, one per host on 8w3s / t529 / tdsr (tpu-group-1: 4 each). The plugin pins the trainer pool to the first tpu-group and
+# every rollout pool to the last one; each TP=4 standalone replica is a 4-bundle STRICT_PACK placement group = one sampler host.
+# Per-host TPU env override (as the Tunix track on this pool): the device plugin injects the 4x8 slice env; each pod is told it is a
+# standalone v6e-4 host. Image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated@sha256:a5d418fe2512c6545ab2673e7509a59f6376b1e972aab73fcd0285ada80a268a (substituted at apply time). Plugin overlay hostPath /home/tpu-m3/plugin
+# (branch tpu-m2-controller @a6ffcfc); SWE loop overlay hostPath /home/tpu-m3/swe_work (first on PYTHONPATH, image copy second).
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-tpum3-p
+  namespace: default
+spec:
+  headGroupSpec:
+    rayStartParams: {"num-cpus": "0"}
+    template:
+      spec:
+        containers:
+        - env:
+          - {name: RAY_TRAIN_V2_ENABLED, value: "1"}
+          image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated@sha256:a5d418fe2512c6545ab2673e7509a59f6376b1e972aab73fcd0285ada80a268a
+          imagePullPolicy: IfNotPresent
+          name: ray-head
+          volumeMounts:
+          - {mountPath: /data, name: data-volume}
+          - {mountPath: /tmp, name: host-tmp}
+          - {mountPath: /verl-hardware-plugin, name: plugin-overlay}
+          - {mountPath: /overlay, name: overlay}
+          ports:
+          - {containerPort: 8265}
+          - {containerPort: 10001}
+          - {containerPort: 8787}
+          resources:
+            limits: {cpu: "16", memory: 64Gi}
+            requests: {cpu: "8", memory: 32Gi}
+        nodeSelector:
+          kubernetes.io/hostname: gke-tpu-0bdace35-cb1q
+        tolerations:
+        - {effect: NoSchedule, key: google.com/tpu, operator: Exists}
+        volumes:
+        - {name: data-volume, hostPath: {path: /home/verl-colocated}}
+        - {name: host-tmp, hostPath: {path: /tmp}}
+        - {name: plugin-overlay, hostPath: {path: /home/tpu-m3/plugin}}
+        - {name: overlay, hostPath: {path: /home/tpu-m3}}
+  workerGroupSpecs:
+  - groupName: tpu-group-0
+    numOfHosts: 1
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      resources: '"{\"tpu-group-0\": 8}"'
+    template:
+      metadata:
+        labels: {app.verl/role: trainer}
+      spec:
+        containers:
+        - env:
+          - {name: RAY_TRAIN_V2_ENABLED, value: "1"}
+          - {name: LIBTPU_CHECKPOINTING_ENABLED, value: "true"}
+          - {name: VERL_PLATFORM, value: tpu}
+          - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+          - {name: TPU_MIN_LOG_LEVEL, value: "0"}
+          - {name: TPU_LOG_DIR, value: /data/logs/ray-tpum3-p}
+          - {name: VERL_LOGGING_LEVEL, value: INFO}
+          - {name: SAGEMAKER_CONTAINER_LOG_LEVEL, value: INFO}
+          - {name: TPU_LIBRARY_PATH, value: /opt/libtpu/libtpu-0.0.48.dev20260912+nightly.so}
+          - {name: TPU_SKIP_MDS_QUERY, value: "1"}
+          image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated@sha256:a5d418fe2512c6545ab2673e7509a59f6376b1e972aab73fcd0285ada80a268a
+          imagePullPolicy: IfNotPresent
+          name: ray-worker
+          resources:
+            limits: {google.com/tpu: "8", memory: 340Gi}
+            requests: {cpu: "48", google.com/tpu: "8", memory: 340Gi}
+          volumeMounts: &mounts
+          - {mountPath: /data, name: data-volume}
+          - {mountPath: /tmp, name: host-tmp}
+          - {mountPath: /dev/shm, name: shm}
+          - {mountPath: /verl-hardware-plugin, name: plugin-overlay}
+          - {mountPath: /overlay, name: overlay}
+        hostPID: true
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: "2x4"
+          cloud.google.com/gke-nodepool: v6e-8-spot-samplers
+          kubernetes.io/hostname: gke-tpu-0bdace35-cb1q
+        tolerations:
+        - {effect: NoSchedule, key: google.com/tpu, operator: Exists}
+        volumes: &vols
+        - {name: data-volume, hostPath: {path: /home/verl-colocated}}
+        - {name: host-tmp, hostPath: {path: /tmp}}
+        - {name: shm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
+        - {name: plugin-overlay, hostPath: {path: /home/tpu-m3/plugin}}
+        - {name: overlay, hostPath: {path: /home/tpu-m3}}
+  - groupName: tpu-group-1
+    numOfHosts: 1
+    replicas: 2
+    minReplicas: 2
+    maxReplicas: 3
+    rayStartParams:
+      resources: '"{\"tpu-group-1\": 4}"'
+    template:
+      metadata:
+        labels: {app.verl/role: sampler}
+      spec:
+        containers:
+        - env:
+          - {name: RAY_TRAIN_V2_ENABLED, value: "1"}
+          - {name: LIBTPU_CHECKPOINTING_ENABLED, value: "true"}
+          - {name: VERL_PLATFORM, value: tpu}
+          - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+          - {name: TPU_MIN_LOG_LEVEL, value: "0"}
+          - {name: TPU_LOG_DIR, value: /data/logs/ray-tpum3-p}
+          - {name: VERL_LOGGING_LEVEL, value: INFO}
+          - {name: SAGEMAKER_CONTAINER_LOG_LEVEL, value: INFO}
+          - {name: TPU_LIBRARY_PATH, value: /opt/libtpu/libtpu-0.0.48.dev20260912+nightly.so}
+          - {name: TPU_HOST_BOUNDS, value: "1,1,1"}
+          - {name: TPU_CHIPS_PER_HOST_BOUNDS, value: "2,2,1"}
+          - {name: TPU_TOPOLOGY, value: "2x2"}
+          - {name: TPU_ACCELERATOR_TYPE, value: v6e-4}
+          - {name: TPU_WORKER_ID, value: "0"}
+          - {name: TPU_WORKER_HOSTNAMES, value: localhost}
+          - {name: TPU_SKIP_MDS_QUERY, value: "1"}
+          image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated@sha256:a5d418fe2512c6545ab2673e7509a59f6376b1e972aab73fcd0285ada80a268a
+          imagePullPolicy: IfNotPresent
+          name: ray-worker
+          resources:
+            limits: {google.com/tpu: "4", memory: 300Gi}
+            requests: {cpu: "48", google.com/tpu: "4", memory: 300Gi}
+          volumeMounts: *mounts
+        hostPID: true
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: "2x2"
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - {key: kubernetes.io/hostname, operator: In, values: [gke-tpu-7fb5c8f1-jpj1, gke-tpu-7fb5c8f1-0mw2]}
+        tolerations:
+        - {effect: NoSchedule, key: google.com/tpu, operator: Exists}
+        volumes: *vols

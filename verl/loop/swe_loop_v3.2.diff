@@ -1,0 +1,669 @@
+diff --git a/integration/verl/swe/integration_check.py b/integration/verl/swe/integration_check.py
+index d07f21a..b8e2a85 100644
+--- a/integration/verl/swe/integration_check.py
++++ b/integration/verl/swe/integration_check.py
+@@ -75,14 +75,16 @@ async def main() -> int:  # noqa: PLR0914
+     parser.add_argument("--instance", default="aiohttp-f0d74880deec")
+     parser.add_argument("--row_offset", type=int, default=0,
+         help="row of the instance in the HF dataset")
++    parser.add_argument("--scenario", default="plain", choices=["plain", "oneshot"],
++        help="oneshot: a Qwen3-style multi-block first turn (think block, several commands, trailing submit) "
++             "and a premature submit, exercising the first-block parser and the empty-diff submit guard")
+     args = parser.parse_args()
+ 
+     import pandas as pd
+     from omegaconf import OmegaConf
+     from transformers import AutoTokenizer
+-    from verl.utils.chat_template import initialize_system_prompt
+ 
+-    from integration.verl.swe.swe_agent_loop import SWEAgentLoop
++    from integration.verl.swe.swe_agent_loop import SWEAgentLoop, default_system_prompt_ids
+ 
+     df = pd.read_parquet(args.parquet)
+     row = next(r for _, r in df.iterrows() if r["extra_info"]["instance_id"] == args.instance)
+@@ -106,6 +108,15 @@ async def main() -> int:  # noqa: PLR0914
+         f"I found the issue; applying the fix now.\n```bash\n{write_cmds}\n```",
+         "The fix is complete.\n```bash\nsubmit\n```",
+     ]
++    if args.scenario == "oneshot":
++        turns = [
++            "<think>\nI could run\n```bash\necho from-think\n```\n</think>\n\nLet me look at the repository layout first.\n"
++            "```bash\nls | head -5\n```\n\nThis shows the files.\n\n---\n\n```bash\necho second-block-must-not-run\n```\n"
++            "Finally submit:\n```bash\nsubmit\n```",
++            "Everything is done.\n```bash\nsubmit\n```",
++            f"I found the issue; applying the fix now.\n```bash\n{write_cmds}\n```",
++            "The fix is complete.\n```bash\nsubmit\n```",
++        ]
+ 
+     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+ 
+@@ -113,7 +124,7 @@ async def main() -> int:  # noqa: PLR0914
+     agent.tokenizer = tokenizer
+     agent.processor = None
+     agent.apply_chat_template_kwargs = {}
+-    agent.system_prompt = initialize_system_prompt(tokenizer)
++    agent.system_prompt = default_system_prompt_ids(tokenizer)
+     agent.rollout_config = OmegaConf.create({"prompt_length": 8192, "response_length": 16384})
+     agent.response_length = 16384
+     agent.max_assistant_turns = 8
+@@ -136,6 +147,9 @@ async def main() -> int:  # noqa: PLR0914
+         and len(output.response_ids) == len(output.response_mask)
+         and n_obs > 0
+     )
++    if args.scenario == "oneshot":
++        ef = output.extra_fields
++        ok = ok and ef.get("swe_submit_rejected") == 1 and ef.get("swe_executed") == 2 and ef.get("swe_multi_block") == 1
+     print("INTEGRATION CHECK:", "PASS" if ok else "FAIL")
+     return 0 if ok else 1
+ 
+diff --git a/integration/verl/swe/sandbox.py b/integration/verl/swe/sandbox.py
+index 47a03c3..91255fe 100644
+--- a/integration/verl/swe/sandbox.py
++++ b/integration/verl/swe/sandbox.py
+@@ -40,12 +40,49 @@ from kubernetes.client.rest import ApiException  # type: ignore[import-not-found
+ from kubernetes.stream import stream as k8s_stream  # type: ignore[import-not-found]
+ 
+ GROUP = "agents.x-k8s.io"
+-VERSION = "v1alpha1"
++VERSION = "v1beta1"  # agent-sandbox v1.0.x serves v1beta1 only (local PoC patch)
+ PLURAL = "sandboxes"
+ CONTAINER = "sandbox"
+ 
+ EXEC_TIMEOUT_DEFAULT = 330  # generous vs the 5-minute grading cap
+ 
++# TPU-M3 loop v3: under 1000-2000 concurrent trajectories the per-turn exec websockets plus creates/deletes overwhelmed the
++# API server path and ~45-65 % of trajectories died with ApiException(0) (no HTTP response) and were salvaged as short
++# zero-reward samples. Every API call now goes through a per-process semaphore (SWE_API_CONCURRENCY, default 32) and
++# transient failures (status 0 / 429 / 5xx, websocket errors) are retried with exponential backoff.
++import os as _os
++
++# TPU-M3 loop v3.1: the single cap starved the control plane. Exec websockets hold a slot for the whole tool command (up to
++# 90 s), so at a version boundary (hundreds of fresh sandboxes) the readiness polls of wait_ready queued behind long execs
++# and timed out ("not Running after 600s") on pods that Kubernetes had reported Ready within seconds (tpum3-dynr2, 13 % of
++# trajectories, then a full stall). Execs and control-plane calls (create / pod read / delete) now have separate caps.
++_API_SEM = threading.BoundedSemaphore(int(_os.getenv("SWE_API_CONCURRENCY", "32")))  # exec websockets
++_CTL_SEM = threading.BoundedSemaphore(int(_os.getenv("SWE_CTL_CONCURRENCY", "16")))  # create / read / delete
++_TRANSIENT_STATUS = {0, 429, 500, 502, 503, 504}
++_API_RETRIES = int(_os.getenv("SWE_API_RETRIES", "5"))
++
++
++def _transient(e: BaseException) -> bool:
++    if isinstance(e, ApiException):
++        return int(getattr(e, "status", 0) or 0) in _TRANSIENT_STATUS
++    return not isinstance(e, SandboxError)  # websocket layer raises bare Exceptions / WebSocketException
++
++
++def _api_call(what: str, fn, *args, retries: int | None = None, **kwargs):  # noqa: ANN001,ANN201
++    """Call a kubernetes API function under the concurrency cap, retrying transient failures with backoff."""
++    n = _API_RETRIES if retries is None else retries
++    last: BaseException | None = None
++    for attempt in range(n + 1):
++        try:
++            with _CTL_SEM:
++                return fn(*args, **kwargs)
++        except Exception as e:  # noqa: BLE001
++            last = e
++            if not _transient(e) or attempt >= n:
++                raise
++            time.sleep(min(60.0, 2.0 * (2**attempt)))
++    raise RuntimeError(f"{what}: unreachable") from last
++
+ 
+ class SandboxError(RuntimeError):
+     pass
+@@ -85,6 +122,9 @@ class SandboxClient:
+         self.namespace = namespace
+         self.custom = k8s_client.CustomObjectsApi()
+         self.core = k8s_client.CoreV1Api()
++        self.last_pod_ready_s: float | None = None  # loop v3.2 diagnostics (set by wait_ready)
++        self.last_wait_polls = 0
++        self.last_wait_sem_s = 0.0
+ 
+     def create(  # noqa: PLR0913
+         self,
+@@ -130,24 +170,46 @@ class SandboxClient:
+                 }
+             },
+         }
+-        self.custom.create_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL,
+-            manifest)
++        _api_call("create", self.custom.create_namespaced_custom_object, GROUP, VERSION, self.namespace, PLURAL,
++                  manifest)
+ 
+     def wait_ready(self, name: str, timeout: float = 300) -> float:
+         """Block until the backing pod is Running; returns elapsed seconds."""
+         start = time.monotonic()
++        polls = 0
++        sem_wait = 0.0
++        last = "no poll completed"
+         while time.monotonic() - start < timeout:
+             try:
+-                pod = self.core.read_namespaced_pod(name, self.namespace)
++                t0 = time.monotonic()
++                with _CTL_SEM:
++                    sem_wait += time.monotonic() - t0
++                    pod = self.core.read_namespaced_pod(name, self.namespace)
++                polls += 1
++                last = f"phase={pod.status.phase}"
+                 if pod.status.phase == "Running":
++                    # loop v3.2 diagnostics: server-side create-to-ready (Ready condition transition minus CR/pod creation)
++                    # next to the client-observed wait, so a slow wait can be attributed to the pod or to the client path.
++                    try:
++                        ready_at = next(c.last_transition_time for c in (pod.status.conditions or [])
++                                        if c.type == "Ready" and c.status == "True")
++                        self.last_pod_ready_s = (ready_at - pod.metadata.creation_timestamp).total_seconds()
++                    except Exception:  # noqa: BLE001
++                        self.last_pod_ready_s = None
++                    self.last_wait_polls = polls
++                    self.last_wait_sem_s = sem_wait
+                     return time.monotonic() - start
+                 if pod.status.phase in ("Failed", "Succeeded"):  # noqa: PLR6201
+                     raise SandboxError(f"{name}: pod reached terminal phase {pod.status.phase}")
+             except ApiException as e:
+-                if e.status != 404:  # pod not created yet  # noqa: PLR2004
++                polls += 1
++                last = f"ApiException status={e.status}"
++                # 404 = pod not created yet; transient API failures (status 0 / 429 / 5xx) are waited out, not raised
++                if e.status != 404 and not _transient(e):  # noqa: PLR2004
+                     raise
+             time.sleep(3)
+-        raise SandboxError(f"{name}: not Running after {timeout}s")
++        # loop v3.1: say what the poll loop saw, so a timeout can be attributed (starved poll vs. pod really not Running)
++        raise SandboxError(f"{name}: not Running after {timeout}s (polls={polls} sem_wait_s={sem_wait:.0f} last={last})")
+ 
+     def exec(
+         self, name: str, cmd: str, timeout: float = EXEC_TIMEOUT_DEFAULT, retries: int = 2
+@@ -158,14 +220,16 @@ class SandboxClient:
+         stream client intermittently dies with e.g. NoneType frame data under
+         concurrency) - callers' commands must therefore be idempotent.
+         """
++        retries = max(retries, _API_RETRIES)
+         last: Exception | None = None
+         for attempt in range(retries + 1):
+             try:
+-                return self._exec_once(name, cmd, timeout)
++                with _API_SEM:  # the websocket is held for the whole command: this caps concurrent execs per process
++                    return self._exec_once(name, cmd, timeout)
+             except Exception as e:  # noqa: BLE001,PERF203 - websocket layer raises bare Exceptions
+                 last = e
+-                time.sleep(2 * (attempt + 1))
+-        raise SandboxError(f"{name}: exec failed after {retries + 1} attempts: {last}")
++                time.sleep(min(60.0, 2.0 * (2**attempt)))
++        raise SandboxError(f"{name}: exec failed after {retries + 1} attempts: {type(last).__name__}: {last}")
+ 
+     def _exec_once(self, name: str, cmd: str, timeout: float) -> tuple[int, str]:
+         resp = k8s_stream(
+@@ -217,8 +281,8 @@ class SandboxClient:
+ 
+     def delete(self, name: str) -> None:
+         try:
+-            self.custom.delete_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL,
+-                name)
++            _api_call("delete", self.custom.delete_namespaced_custom_object, GROUP, VERSION, self.namespace, PLURAL,
++                      name, retries=3)
+         except ApiException as e:
+             if e.status != 404:  # noqa: PLR2004
+                 raise
+diff --git a/integration/verl/swe/scaffold.py b/integration/verl/swe/scaffold.py
+index 1f5adcd..d21f113 100644
+--- a/integration/verl/swe/scaffold.py
++++ b/integration/verl/swe/scaffold.py
+@@ -21,11 +21,21 @@ ends the episode and triggers grading.
+ 
+ from __future__ import annotations
+ 
++import os
+ import re
+ 
+ SUBMIT_COMMAND = "submit"
+ 
+-BASH_BLOCK_RE = re.compile(r"```(?:bash|sh|shell)?\s*\n(.*?)```", re.DOTALL)
++BASH_BLOCK_RE = re.compile(r"```(?:bash|sh|shell)?\s*\n(.*?)```", re.DOTALL)  # legacy (TPU-M3 ladder/dyn runs); see parse_turn
++
++# Fence line: ``` plus an optional language tag, optionally followed by content on the same line (``` ``bash ls`` `` is seen
++# from small models). Scanning line by line keeps opening and closing fences apart, so prose between two blocks is never
++# taken for a command (the legacy regex matched a closing fence as an opening one whenever an opening fence was not in
++# its expected form, executing the prose: rc 127 "This: not found" in 80 of 608 executed commands, TPU-M3 section 3.2).
++FENCE_LINE_RE = re.compile(r"^[ \t]*```([A-Za-z0-9_+.-]*)[ \t]*(.*?)[ \t]*$")
++BASH_TAGS = frozenset({"", "bash", "sh", "shell", "console", "zsh"})
++THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
++BLOCK_POLICY = os.getenv("SWE_BLOCK_POLICY", "first")  # which fenced block of a turn is executed: first | last
+ 
+ # Paths the agent is not allowed to influence at grading time. Chunks of the
+ # agent's patch touching these are stripped before pristine-sandbox grading.
+@@ -36,17 +46,81 @@ TEST_PATH_RE = re.compile(
+ NO_COMMAND_OBSERVATION = (
+     "No bash code block found in your reply. Respond with your reasoning and "
+     "exactly one fenced bash block, e.g.:\n```bash\nls\n```\n"
++    "Do not repeat a command you already ran. "
+     f"When you are completely done, submit with:\n```bash\n{SUBMIT_COMMAND}\n```"
+ )
+ 
++SUBMIT_REJECTED_OBSERVATION = (
++    "submit rejected: `git diff HEAD` is empty, you have not changed any file yet. "
++    "Inspect the code (grep, sed -n), make the fix with shell commands (sed -i or a heredoc), "
++    "verify it, then submit."
++)
+ 
+-def parse_bash_command(text: str) -> str | None:
+-    """Extract the command from the LAST fenced bash block, or None."""
+-    blocks = BASH_BLOCK_RE.findall(text)
++
++REPEATED_COMMAND_OBSERVATION = (
++    "You already ran exactly this command in your previous turn; its output is above and has not changed. "
++    "Do something different: list the directory (ls), open another file (sed -n '1,80p' path), edit with sed -i or a "
++    "heredoc, or run the tests."
++)
++
++COMMENT_ONLY_OBSERVATION = (
++    "Your bash block contained only comments or was empty, so nothing ran. Give one real shell command in the block."
++)
++
++
++def is_comment_only(command: str) -> bool:
++    """True when every line of the block is blank or a # comment (the model 'narrating' inside the fence)."""
++    return all((not ln.strip()) or ln.lstrip().startswith("#") for ln in command.splitlines())
++
++
++def extra_blocks_note(n_blocks: int, executed: str) -> str:
++    return (
++        f"\nNote: your reply contained {n_blocks} fenced blocks; only the {executed} one was executed. "
++        "Send ONE command per turn and wait for its output before the next step."
++    )
++
++
++def strip_thinking(text: str) -> str:
++    """Drop Qwen3-style <think>...</think> reasoning; an unterminated <think> (budget ran out while thinking) leaves nothing."""
++    if "<think>" in text and "</think>" not in text:
++        return ""
++    return THINK_RE.sub("", text)
++
++
++def parse_bash_blocks(text: str) -> list[str]:
++    """Every fenced block of the (thinking-stripped) text whose tag is a shell tag, in order; prose is never a block."""
++    blocks: list[str] = []
++    open_tag: str | None = None
++    buf: list[str] = []
++    for line in text.splitlines():
++        m = FENCE_LINE_RE.match(line)
++        if m and open_tag is None:
++            open_tag, inline = m.group(1).lower(), m.group(2)
++            buf = [inline] if inline else []
++            continue
++        if m and open_tag is not None:  # any fence line closes the open block (trailing text after ``` is dropped)
++            if open_tag in BASH_TAGS:
++                blocks.append("\n".join(buf).strip())
++            open_tag, buf = None, []
++            continue
++        if open_tag is not None:
++            buf.append(line)
++    return [b for b in blocks if b]
++
++
++def parse_turn(text: str, policy: str | None = None) -> tuple[str | None, int]:
++    """(command, number of shell blocks) for one assistant turn: the FIRST shell block by default (a one-shot plan then
++    runs step by step instead of ending on its final ``submit``), the last with SWE_BLOCK_POLICY=last."""
++    blocks = parse_bash_blocks(strip_thinking(text))
+     if not blocks:
+-        return None
+-    command: str = blocks[-1]
+-    return command.strip()
++        return None, 0
++    pol = policy or BLOCK_POLICY
++    return (blocks[-1] if pol == "last" else blocks[0]), len(blocks)
++
++
++def parse_bash_command(text: str) -> str | None:
++    """Extract the command of a turn (see parse_turn), or None."""
++    return parse_turn(text)[0]
+ 
+ 
+ def is_submit(command: str) -> bool:
+@@ -96,14 +170,17 @@ def build_system_prompt(base_prompt: str) -> str:
+     return (
+         f"{base_prompt}\n\n"
+         "## Interaction protocol\n"
+-        "You are in a live shell session in the repository sandbox. In every "
++        "You are in a live shell session at the root of the repository (the "
++        "current directory; start with `ls` to see its layout). In every "
+         "reply, briefly reason about the next step, then give EXACTLY ONE "
+         "fenced bash block with one command to run, e.g.:\n"
+-        "```bash\ngrep -rn \"pattern\" src/ | head -20\n```\n"
+-        "The command's output will be returned to you. Each command runs in a "
++        "```bash\ngrep -rn \"pattern\" . --include=*.py | head -20\n```\n"
++        "The command's output will be returned to you before you write the next "
++        "step; do not plan several commands in one reply. Each command runs in a "
+         "fresh shell from the repository root: cd and environment variables do "
+         "NOT persist between turns. Edit files with shell commands (heredocs, "
+         "sed). Long outputs are truncated - prefer targeted commands (head, "
+-        "grep). When your fix is complete and verified, end the session with:\n"
+-        f"```bash\n{SUBMIT_COMMAND}\n```"
++        "grep). Only after you have edited the code and verified the fix, end the "
++        f"session with:\n```bash\n{SUBMIT_COMMAND}\n```\n"
++        "Submitting without any file change is rejected."
+     )
+diff --git a/integration/verl/swe/swe_agent_loop.py b/integration/verl/swe/swe_agent_loop.py
+index 8ef0d62..4cde6fe 100644
+--- a/integration/verl/swe/swe_agent_loop.py
++++ b/integration/verl/swe/swe_agent_loop.py
+@@ -34,8 +34,12 @@ generate returned a bare token id list.
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import os
++import time
++from collections.abc import Mapping
++from concurrent.futures import ThreadPoolExecutor
+ from typing import Any
+ from uuid import uuid4
+ 
+@@ -48,12 +52,24 @@ from verl.utils.profiler import simple_timer  # type: ignore[import-not-found]
+ 
+ from integration.verl.swe.pristine_grader import grade_patch_pristine
+ from integration.verl.swe.sandbox import SandboxClient, get_thread_client, make_name
++
++# TPU-M3 loop v3.1: all sandbox I/O (create + wait_ready, exec, grade, delete) runs on a dedicated thread pool instead of the
++# event loop's default executor (min(32, cpu + 4) threads per process). With 100+ live trajectories per worker process the
++# default pool filled with blocking sandbox calls and the per-turn tokenizer.decode calls behind them stopped, so no new
++# generate request left the process (tpum3-dynr2: LB in-flight 0 with 350 sandboxes Running). Concurrency towards the API
++# server is still capped by the semaphores in sandbox.py; the pool only decouples decode from sandbox I/O.
++_SANDBOX_IO_POOL = ThreadPoolExecutor(max_workers=int(os.getenv("SWE_IO_THREADS", "256")), thread_name_prefix="swe-sandbox-io")
+ from integration.verl.swe.scaffold import (
+     NO_COMMAND_OBSERVATION,
+     build_system_prompt,
+     format_observation,
+     is_submit,
+-    parse_bash_command,
++    parse_turn,
++    extra_blocks_note,
++    is_comment_only,
++    SUBMIT_REJECTED_OBSERVATION,
++    REPEATED_COMMAND_OBSERVATION,
++    COMMENT_ONLY_OBSERVATION,
+ )
+ 
+ logger = logging.getLogger(__name__)
+@@ -71,6 +87,14 @@ BASELINE_CMD = (
+ )
+ 
+ 
++def default_system_prompt_ids(tokenizer: Any) -> list[int]:  # noqa: ANN401
++    """Token ids of the system prompt the chat template injects for a conversation
++    without an explicit system message (verl <= 0.9 ``initialize_system_prompt``).
++    Used to strip that prefix when tokenizing delta user messages."""
++    ids = tokenizer.apply_chat_template([{}], add_generation_prompt=False, tokenize=True)
++    return list(ids["input_ids"] if isinstance(ids, Mapping) else ids)
++
++
+ @register("swe_agent")
+ class SWEAgentLoop(AgentLoopBase):
+     def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+@@ -82,6 +106,37 @@ class SWEAgentLoop(AgentLoopBase):
+             multi_turn.get("max_assistant_turns") if multi_turn else None
+         ) or 32
+         self._init_tunables()
++        self._init_chat_template_compat()
++
++    # verl 0.10.0.dev removed AgentLoopBase.apply_chat_template (replaced by the
++    # continuous-token ct_* API) and verl.utils.chat_template. Keep the validated
++    # 0.9 tokenization path for this loop (rl-pool-autoscaler PoC compat shim;
++    # token discipline unchanged: LLM tokens verbatim, observations as delta user
++    # messages with the default system prompt stripped).
++    def _init_chat_template_compat(self) -> None:
++        if not hasattr(self, "system_prompt"):
++            self.system_prompt = default_system_prompt_ids(self.tokenizer)
++
++    if not hasattr(AgentLoopBase, "apply_chat_template"):
++
++        async def apply_chat_template(  # type: ignore[override]
++            self,
++            messages: list[dict[str, Any]],
++            *,
++            remove_system_prompt: bool = False,
++            **kwargs: Any,  # noqa: ANN401
++        ) -> list[int]:
++            def _tokenize() -> list[int]:
++                ids = self.tokenizer.apply_chat_template(
++                    messages,
++                    add_generation_prompt=True,
++                    tokenize=True,
++                    **(getattr(self, "apply_chat_template_kwargs", None) or {}),
++                )
++                ids = list(ids["input_ids"] if isinstance(ids, Mapping) else ids)
++                return ids[len(self.system_prompt):] if remove_system_prompt else ids
++
++            return await self.loop.run_in_executor(None, _tokenize)
+ 
+     def _init_tunables(self) -> None:
+         """Initialize env-tunable knobs in one place.
+@@ -100,6 +155,13 @@ class SWEAgentLoop(AgentLoopBase):
+         # test runs are timing-sensitive.
+         self.sandbox_cpu_request = os.getenv("SWE_SANDBOX_CPU_REQUEST", "500m")
+         self.sandbox_mem_request = os.getenv("SWE_SANDBOX_MEM_REQUEST", "1Gi")
++        # TPU-M3 reward work: reject a submit while `git diff HEAD` is empty (the one-shot-plan mode ended 35 % of the
++        # trajectories on turn 1 with no edit), and dump every turn's raw text/command/rc to a JSONL (per worker file).
++        self.submit_guard = os.getenv("SWE_SUBMIT_GUARD", "1") == "1"
++        self.turn_dump = os.getenv("SWE_TURN_DUMP", "")
++        # A command identical to the previous turn's is not re-run (the 1.7B model loops on one command: 62 % of consecutive
++        # turns identical in tpum3-rwa); comment-only blocks are not run either. Both answer with an instruction.
++        self.repeat_guard = os.getenv("SWE_REPEAT_GUARD", "1") == "1"
+ 
+     async def run(self, sampling_params: dict[str, Any], **kwargs: Any) -> AgentLoopOutput:  # noqa: C901,PLR0912,PLR0914,PLR0915,ANN401
+         extra_info = dict(kwargs["extra_info"])
+@@ -118,13 +180,25 @@ class SWEAgentLoop(AgentLoopBase):
+         assistant_turns = user_turns = 0
+         submitted = False
+         reward, reason = 0.0, "no-submit"
++        # verl >= 0.10 stamps the model-weight version on every TokenOutput
++        # (extra_fields global_steps / min_global_steps / max_global_steps) and
++        # the fully-async trainer requires them on the final output (partial-
++        # rollout staleness accounting). Mirror ToolAgentLoop: keep the first
++        # turn's stamps, bump max_global_steps on later turns.
++        gen_extra: dict[str, Any] = {}
++        stats: dict[str, int] = {"turns": 0, "wellformed": 0, "multi_block": 0, "executed": 0, "rc0": 0, "submit_rejected": 0,
++                                 "patch_nonempty": 0, "repeated": 0, "comment_only": 0}
++        prev_command: str | None = None
++        # TPU-M3 observability (local overlay only): per-turn trace for 1 in 20 trajectories (command as parsed, rc, observation head).
++        trace = (int(request_id[:4], 16) % 20) == 0
++        trace_turns: list[str] = []
+ 
+         client = None
+         # Boot the sandbox concurrently with the first generate: turn 1 never
+         # needs the sandbox until its command executes, and sandbox startup
+         # (scheduling + image pull) is tens of seconds.
+         sandbox_future = self.loop.run_in_executor(
+-            None, lambda: self._create_sandbox(sandbox_name, extra_info["docker_image"])
++            _SANDBOX_IO_POOL, lambda: self._create_sandbox(sandbox_name, extra_info["docker_image"], stats)
+         )
+         try:
+             while (
+@@ -139,6 +213,13 @@ class SWEAgentLoop(AgentLoopBase):
+                     )
+                 token_ids = getattr(output, "token_ids", output)
+                 log_probs = getattr(output, "log_probs", None)
++                out_extra = getattr(output, "extra_fields", None) or {}
++                if not gen_extra:
++                    gen_extra.update(out_extra)
++                else:
++                    for key in ("global_steps", "max_global_steps"):
++                        if out_extra.get(key) is not None:
++                            gen_extra[key] = out_extra[key]
+                 budget = self.response_length - len(response_mask)
+                 token_ids = list(token_ids)[:budget]
+                 full_ids += token_ids
+@@ -155,21 +236,57 @@ class SWEAgentLoop(AgentLoopBase):
+                 text = await self.loop.run_in_executor(
+                     None, lambda t=tuple(token_ids): self.tokenizer.decode(t)
+                 )
+-                command = parse_bash_command(text)
++                command, n_blocks = parse_turn(text)
++                stats["turns"] += 1
++                stats["wellformed"] += 1 if command is not None else 0
++                stats["multi_block"] += 1 if n_blocks > 1 else 0
++                if trace:
++                    trace_turns.append(f"T{assistant_turns} blocks={n_blocks} think={'<think>' in text} cmd={(command or 'NO-BASH-BLOCK')[:120]!r}")
++                rc: int | None = None
+                 if command is not None and is_submit(command):
+-                    submitted = True
+-                    break
+-
+-                if command is None:
++                    if assistant_turns == 1:
++                        # TPU-M3 observability (local overlay only): why does a trajectory submit on its first turn?
++                        logger.info("swe_agent %s: TURN1-SUBMIT text_head=%r text_tail=%r",
++                                    extra_info.get("instance_id"), text[:400], text[-200:])
++                    rejected = False
++                    if self.submit_guard:
++                        with simple_timer("tool_calls", metrics):
++                            if client is None:
++                                client = await sandbox_future
++                            rc_d, diff_now = await self.loop.run_in_executor(
++                                _SANDBOX_IO_POOL, lambda: client.exec(sandbox_name, DIFF_CMD, timeout=120)
++                            )
++                        rejected = rc_d == 0 and not diff_now.strip()
++                    if not rejected:
++                        submitted = True
++                        self._dump_turn(extra_info, request_id, assistant_turns, text, command, n_blocks, None, "submit")
++                        break
++                    stats["submit_rejected"] += 1
++                    observation = SUBMIT_REJECTED_OBSERVATION
++                elif command is None:
+                     observation = NO_COMMAND_OBSERVATION
++                elif is_comment_only(command):
++                    stats["comment_only"] += 1
++                    observation = COMMENT_ONLY_OBSERVATION
++                elif self.repeat_guard and prev_command is not None and command.strip() == prev_command.strip():
++                    stats["repeated"] += 1
++                    observation = REPEATED_COMMAND_OBSERVATION
+                 else:
+                     with simple_timer("tool_calls", metrics):
+                         if client is None:
+                             client = await sandbox_future
+                         rc, out = await self.loop.run_in_executor(
+-                            None, lambda c=command: self._run_command(client, sandbox_name, c)  # noqa: B023
++                            _SANDBOX_IO_POOL, lambda c=command: self._run_command(client, sandbox_name, c)  # noqa: B023
+                         )
++                    stats["executed"] += 1
++                    stats["rc0"] += 1 if rc == 0 else 0
+                     observation = format_observation(rc, out, self.obs_max_chars)
++                    if n_blocks > 1:
++                        observation += extra_blocks_note(n_blocks, "last" if os.getenv("SWE_BLOCK_POLICY", "first") == "last" else "first")
++                prev_command = command
++                self._dump_turn(extra_info, request_id, assistant_turns, text, command, n_blocks, rc, observation)
++                if trace:
++                    trace_turns.append(f"  -> rc={rc if rc is not None else 'n/a'} obs={observation[:160]!r}")
+ 
+                 obs_ids = await self.apply_chat_template(
+                     [{"role": "user", "content": observation}], remove_system_prompt=True
+@@ -191,10 +308,17 @@ class SWEAgentLoop(AgentLoopBase):
+                     if client is None:
+                         client = await sandbox_future
+                     reward, reason = await self.loop.run_in_executor(
+-                        None, lambda: self._grade(client, sandbox_name, extra_info)
++                        _SANDBOX_IO_POOL, lambda: self._grade(client, sandbox_name, extra_info, stats)
+                     )
+         except Exception as e:  # sandbox/infra failure: salvage the trajectory  # noqa: BLE001
+-            logger.warning("swe_agent rollout error on %s: %s", extra_info.get("instance_id"), e)
++            if not gen_extra:
++                # TPU-M3 fix (local overlay): no generate output was ever received (e.g. the serving replica died before the
++                # first turn), so the output would carry no weight-version stamps and the V1 trainer fails on int(None) when
++                # tagging it (tpum3-dyn step 13). Re-raise: verl marks the prompt group failed and refills it.
++                logger.warning("swe_agent rollout error before any generation on %s: %s (re-raised for refill)", extra_info.get("instance_id"), e)
++                raise
++            logger.warning("swe_agent rollout error on %s: %s: %s", extra_info.get("instance_id"), type(e).__name__,
++                           str(e).replace("\n", " | ")[:300])
+             reward, reason = 0.0, f"rollout-error: {type(e).__name__}"
+         finally:
+             if client is None:
+@@ -207,7 +331,7 @@ class SWEAgentLoop(AgentLoopBase):
+             # even when wait_ready timed out (pod stuck Pending).
+             try:  # noqa: SIM105
+                 await self.loop.run_in_executor(
+-                    None, lambda: get_thread_client(self.namespace).delete(sandbox_name)
++                    _SANDBOX_IO_POOL, lambda: get_thread_client(self.namespace).delete(sandbox_name)
+                 )
+             except Exception:  # noqa: BLE001,S110
+                 pass
+@@ -220,9 +344,14 @@ class SWEAgentLoop(AgentLoopBase):
+             response_ids = [pad_id]
+             response_mask = [0]
+             response_logprobs = [0.0]
++        # TPU-M3 observability (local overlay only): per-trajectory generate / tool seconds for the gen-vs-tool split.
++        if trace:
++            logger.info("swe_agent %s: TRACE submitted=%s reason=%s reward=%s turns=%d\n%s",
++                        extra_info.get("instance_id"), submitted, reason, reward, assistant_turns, "\n".join(trace_turns)[:6000])
+         logger.info(
+-            "swe_agent %s: reward=%s reason=%s turns=%d resp_tokens=%d",
++            "swe_agent %s: reward=%s reason=%s turns=%d resp_tokens=%d gen_s=%.1f tool_s=%.1f stats=%s",
+             extra_info.get("instance_id"), reward, reason, assistant_turns, len(response_ids),
++            float(metrics.get("generate_sequences", 0.0)), float(metrics.get("tool_calls", 0.0)), json.dumps(stats),
+         )
+         return AgentLoopOutput(
+             prompt_ids=prompt_ids,
+@@ -232,20 +361,49 @@ class SWEAgentLoop(AgentLoopBase):
+             num_turns=assistant_turns + user_turns + 1,
+             metrics=metrics,
+             reward_score=reward,
+-            extra_fields={"swe_reason": reason, "swe_submitted": submitted},
++            extra_fields={**gen_extra, "swe_reason": reason, "swe_submitted": submitted, **{f"swe_{k}": v for k, v in stats.items()}},
+         )
+ 
++    def _dump_turn(self, extra_info: dict, request_id: str, turn: int, text: str, command: str | None,
++                   n_blocks: int, rc: int | None, observation: str) -> None:
++        """Per-turn JSONL record (SWE_TURN_DUMP=<path prefix>; one file per worker process): raw assistant text, parsed
++        command, block count, return code and observation head. Append-only, best effort."""
++        if not self.turn_dump:
++            return
++        try:
++            path = f"{self.turn_dump}.{os.getpid()}.jsonl"
++            rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "instance_id": extra_info.get("instance_id"),
++                   "request_id": request_id, "turn": turn, "text": text, "command": command, "n_blocks": n_blocks,
++                   "rc": rc, "observation_head": observation[:400], "think": "<think>" in text,
++                   "think_closed": "</think>" in text}
++            with open(path, "a") as f:
++                f.write(json.dumps(rec) + "\n")
++        except Exception as e:  # noqa: BLE001
++            logger.debug("turn dump failed: %s", e)
++
+     # --- sync helpers, always called via run_in_executor -------------------
+ 
+-    def _create_sandbox(self, name: str, image: str):
++    def _create_sandbox(self, name: str, image: str, stats: dict | None = None):
+         client = get_thread_client(self.namespace)
++        t0 = time.monotonic()
+         client.create(
+             name, image,
+             cpu_request=self.sandbox_cpu_request,
+             memory_request=self.sandbox_mem_request,
+         )
+-        client.wait_ready(name, timeout=self.sandbox_wait_s)
++        t1 = time.monotonic()
++        waited = client.wait_ready(name, timeout=self.sandbox_wait_s)
++        t2 = time.monotonic()
+         client.exec(name, BASELINE_CMD, timeout=120)
++        if stats is not None:
++            # loop v3.2 diagnostics (per trajectory, printed in the completion line): create call, client-observed wait_ready,
++            # server-side pod create-to-ready, readiness polls and time spent waiting for the control-plane semaphore.
++            stats["sbx_create_s"] = round(t1 - t0, 1)
++            stats["sbx_wait_s"] = round(waited, 1)
++            stats["sbx_pod_ready_s"] = None if client.last_pod_ready_s is None else round(client.last_pod_ready_s, 1)
++            stats["sbx_polls"] = client.last_wait_polls
++            stats["sbx_sem_s"] = round(client.last_wait_sem_s, 1)
++            stats["sbx_baseline_s"] = round(time.monotonic() - t2, 1)
+         return client
+ 
+     def _run_command(self, client: SandboxClient, name: str, command: str) -> tuple[int, str]:
+@@ -254,8 +412,10 @@ class SWEAgentLoop(AgentLoopBase):
+         wrapped = f"cd /testbed && timeout {self.cmd_timeout_s} sh -c {shlex.quote(command)}"
+         return client.exec(name, wrapped, timeout=self.cmd_timeout_s + 30)
+ 
+-    def _grade(self, client, name: str, extra_info: dict) -> tuple[float, str]:
++    def _grade(self, client, name: str, extra_info: dict, stats: dict | None = None) -> tuple[float, str]:
+         rc, diff = client.exec(name, DIFF_CMD, timeout=120)
++        if stats is not None and diff.strip():
++            stats["patch_nonempty"] = 1
+         if rc != 0:
+             return 0.0, f"diff-failed: {diff[-200:]}"
+         if len(diff) > MAX_DIFF_BYTES:

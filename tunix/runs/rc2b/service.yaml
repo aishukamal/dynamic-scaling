@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rc2b-orch-metrics
+  namespace: default
+  labels: {app: tunix-exporter, run-prefix: "rc2b"}
+spec:
+  type: ClusterIP
+  selector: {jobset.sigs.k8s.io/jobset-name: rc2b-orch}
+  ports: [{name: metrics, port: 8851, targetPort: 8851}]

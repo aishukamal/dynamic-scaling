@@ -1,0 +1,20 @@
+# tunix-poc:mlperf-65d021b-clean = the repo's OWN Dockerfile (atwigg/mlperf @65d021bdd, unmodified) with INSTALL_RAIDEN=true.
+# Only substitution: our source-built tpu_sync_jax wheel (gs://aishuk-test-tpu-sync-wheels/20261014225303/) dropped into
+# raiden_wheels/ (the directory the Dockerfile COPYs and scripts/install_raiden.sh prefers over the private pinned URL).
+# No extra pip installs, no re-pins, no patch files.
+steps:
+  - id: fetch-wheel
+    name: gcr.io/cloud-builders/gsutil
+    args: ["cp", "gs://aishuk-test-tpu-sync-wheels/20261014225303/tpu_sync_jax-*.whl", "raiden_wheels/"]
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    env: ["DOCKER_BUILDKIT=1"]
+    args: ["build", "--build-arg", "INSTALL_RAIDEN=true",
+           "-t", "us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-clean", "-f", "Dockerfile", "."]
+  - id: smoke
+    name: gcr.io/cloud-builders/docker
+    args: ["run", "--rm", "us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-clean", "bash", "-c",
+           "python -c \"import jax, vllm, tunix, tpu_sync, importlib.metadata as m; print('jax', jax.__version__, 'vllm', vllm.__version__, 'tpu_sync_jax', m.version('tpu_sync_jax'))\" && python -c \"from tunix.experimental.weight_sync import raiden_handler; import tunix.experimental.orchestrator.orchestrator\" && pip list 2>/dev/null | grep -i -E '^(jax|jaxlib|libtpu|vllm|tpu-inference|flax|transformers|torch|tpu_sync_jax|tpu-sync-jax) ' && ls -la /app/raiden_wheels && echo SMOKE-OK"]
+images: ["us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-clean"]
+timeout: 14400s
+options: {machineType: E2_HIGHCPU_32, diskSizeGb: 400}

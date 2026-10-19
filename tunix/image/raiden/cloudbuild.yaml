@@ -1,0 +1,15 @@
+steps:
+  - id: fetch-wheel
+    name: gcr.io/cloud-builders/gsutil
+    args: ["cp", "gs://aishuk-test-tpu-sync-wheels/${_STAMP}/tpu_sync_jax-*.whl", "wheels/"]
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-raiden-${_STAMP}", "."]
+  - id: smoke
+    name: gcr.io/cloud-builders/docker
+    args: ["run", "--rm", "us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-raiden-${_STAMP}", "bash", "-c",
+           "python -c \"import tpu_sync, importlib.metadata as m; print('tpu_sync_jax', m.version('tpu_sync_jax'))\" && python -c \"from tunix.experimental.weight_sync import raiden_handler; print('raiden_handler import ok')\" && echo SMOKE-OK"]
+images: ["us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-raiden-${_STAMP}"]
+timeout: 3600s
+substitutions: {_STAMP: "0"}
+options: {machineType: E2_HIGHCPU_8, diskSizeGb: 200}

@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tunix-controller-rl60
+  namespace: default
+  labels: {app: tunix-controller, run-prefix: "rl60"}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: tunix-controller, run-prefix: "rl60"}}
+  template:
+    metadata:
+      labels: {app: tunix-controller, run-prefix: "rl60"}
+    spec:
+      serviceAccountName: tunix-controller
+      nodeSelector: {cloud.google.com/gke-nodepool: pathways-head-jax}
+      tolerations:
+      - {key: cloud.google.com/gke-nodepool, operator: Exists, effect: NoSchedule}
+      containers:
+      - name: controller
+        image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-raiden-20261014225303
+        imagePullPolicy: IfNotPresent
+        command: ["python3", "-m", "rl_pool_autoscaler.controller.tunix_main"]
+        env:
+        - {name: PYTHONPATH, value: /code}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: STATUS_URL, value: "http://rl60-orch-metrics.default.svc.cluster.local:8853"}
+        - {name: POLL_INTERVAL_S, value: "10"}
+        - {name: MIN_WORKERS, value: "1"}
+        - {name: MAX_WORKERS, value: "3"}
+        - {name: IDLE_HI, value: "0.15"}
+        - {name: IDLE_LO, value: "0.0"}
+        - {name: DWELL_STEPS, value: "2"}
+        - {name: MIN_ACTION_INTERVAL_S, value: "120"}
+        - {name: MQ_HI_FRAC, value: "0.0"}
+        - {name: TEMPLATES, value: "rl60-roll-1=rl60-roll-1=/templates/rollout-1.yaml,rl60-roll-2=rl60-roll-2=/templates/rollout-2.yaml"}
+        - {name: BASE_WORKERS, value: "rl60-roll-0"}
+        - {name: JOIN_TIMEOUT_S, value: "1500"}
+        - {name: EVICT_TIMEOUT_S, value: "180"}
+        - {name: GUARD_ENABLED, value: "1"}
+        - {name: GUARD_WINDOW, value: "2"}
+        - {name: GUARD_MIN_GAIN, value: "0.10"}
+        - {name: UTIL_HI, value: "0.75"}
+        - {name: UTIL_LO, value: "0.40"}
+        - {name: UTIL_STAT, value: "mean"}
+        - {name: UTIL_WINDOW, value: ""}
+        - {name: QUEUE_MIN, value: "8"}
+        - {name: DECISIONS_JSONL, value: /var/log/rl-pool/decisions-rl60.jsonl}
+        - {name: DRY_RUN, value: "0"}
+        - {name: NAMESPACE, value: default}
+        resources:
+          requests: {cpu: "200m", memory: "512Mi"}
+          limits: {cpu: "1", memory: "1Gi"}
+        volumeMounts:
+        - {name: code, mountPath: /code}
+        - {name: templates, mountPath: /templates}
+        - {name: decisions, mountPath: /var/log/rl-pool}
+      volumes:
+      - name: code
+        configMap:
+          name: tunix-controller-code
+          items:
+          - {key: pkg_init.py, path: rl_pool_autoscaler/__init__.py}
+          - {key: prom.py, path: rl_pool_autoscaler/prom.py}
+          - {key: ctl_init.py, path: rl_pool_autoscaler/controller/__init__.py}
+          - {key: policy.py, path: rl_pool_autoscaler/controller/policy.py}
+          - {key: tunix_backend.py, path: rl_pool_autoscaler/controller/tunix_backend.py}
+          - {key: tunix_main.py, path: rl_pool_autoscaler/controller/tunix_main.py}
+      - name: templates
+        configMap: {name: tunix-controller-templates-rl60}
+      - name: decisions
+        hostPath: {path: /tmp/tunix-controller, type: DirectoryOrCreate}

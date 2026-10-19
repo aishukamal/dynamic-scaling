@@ -1,0 +1,18 @@
+# exactly the SWE loop's SandboxClient.create() template (integration/verl/swe/sandbox.py), as a manifest
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata: {name: tpum3-smoke-aiohttp, namespace: agents-system}
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      automountServiceAccountToken: false
+      nodeSelector: {sandbox.gke.io/runtime: gvisor}
+      tolerations:
+      - {key: sandbox.gke.io/runtime, operator: Equal, value: gvisor, effect: NoSchedule}
+      containers:
+      - name: sandbox
+        image: us-central1-docker.pkg.dev/aishuk-test/swe-mirror/namanjain12/aiohttp_final:f0d74880deec8fcd982bce639c93c5e130d41198
+        command: ["sleep", "infinity"]
+        securityContext: {capabilities: {drop: ["ALL"]}}
+        resources: {requests: {cpu: 200m, memory: 768Mi}, limits: {cpu: "2", memory: 4Gi}}

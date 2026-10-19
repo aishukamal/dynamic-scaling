@@ -1,0 +1,530 @@
+name: verl Release Compatibility
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: verl-release-compat
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check_release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      base_sha: ${{ steps.release.outputs.base_sha }}
+      branch: ${{ steps.release.outputs.branch }}
+      changed: ${{ steps.release.outputs.changed }}
+      install_outcome: ${{ steps.result.outputs.install_outcome }}
+      status: ${{ steps.result.outputs.status }}
+      tag: ${{ steps.release.outputs.tag }}
+      test_outcome: ${{ steps.result.outputs.test_outcome }}
+      upstream_sha: ${{ steps.release.outputs.upstream_sha }}
+
+    steps:
+      - name: Require the trusted main workflow ref
+        if: github.ref != 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "Run this workflow from the main branch." >&2
+          exit 1
+
+      - name: Check out trusted main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Detect a new stable verl tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD)"
+          current_tag="$(python3 -c 'import json; print(json.load(open("compat/verl-release.json", encoding="utf-8"))["tag"])')"
+          current_sha="$(python3 -c 'import json; print(json.load(open("compat/verl-release.json", encoding="utf-8"))["commit"])')"
+          tag="$(
+            gh api --paginate 'repos/verl-project/verl/tags?per_page=100' --jq '.[].name' |
+              python3 -c '
+          import re
+          import sys
+
+          pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:\.post(\d+))?$")
+          releases = []
+          for raw_tag in sys.stdin:
+              value = raw_tag.strip()
+              match = pattern.fullmatch(value)
+              if match is None:
+                  continue
+              major, minor, patch = (int(match.group(index)) for index in range(1, 4))
+              post = -1 if match.group(4) is None else int(match.group(4))
+              releases.append(((major, minor, patch, post), value.startswith("v"), value))
+          if not releases:
+              raise SystemExit("No stable semantic-version tag found")
+          print(max(releases)[2])
+          '
+          )"
+          upstream_sha="$(gh api "repos/verl-project/verl/commits/$tag" --jq .sha)"
+          if [[ ! "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Unexpected release commit: $upstream_sha" >&2
+            exit 1
+          fi
+          CURRENT_TAG="$current_tag" RELEASE_TAG="$tag" python3 - <<'PY'
+          import os
+          import re
+
+          pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:\.post(\d+))?$")
+
+          def version(value: str) -> tuple[int, int, int, int]:
+              match = pattern.fullmatch(value)
+              if match is None:
+                  raise SystemExit(f"Invalid tracked release tag: {value}")
+              major, minor, patch = (int(match.group(index)) for index in range(1, 4))
+              post = -1 if match.group(4) is None else int(match.group(4))
+              return major, minor, patch, post
+
+          if version(os.environ["RELEASE_TAG"]) < version(os.environ["CURRENT_TAG"]):
+              raise SystemExit(
+                  f"Refusing release downgrade from {os.environ['CURRENT_TAG']} "
+                  f"to {os.environ['RELEASE_TAG']}"
+              )
+          PY
+          branch="automation/verl-${tag}-${upstream_sha:0:12}"
+          changed=true
+          if [[ "$tag" == "$current_tag" && "$upstream_sha" == "$current_sha" ]]; then
+            changed=false
+            echo "Already tracking $tag at $upstream_sha"
+          fi
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Record release metadata
+        if: steps.release.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.release.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          mkdir -p .compat-work
+          printf 'tag=%s\ncommit=%s\n' "$TAG" "$UPSTREAM_SHA" > .compat-work/release.txt
+
+      - name: Check out the exact verl release commit
+        if: steps.release.outputs.changed == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: verl-project/verl
+          ref: ${{ steps.release.outputs.upstream_sha }}
+          path: .upstream/verl
+          persist-credentials: false
+
+      - name: Set up Python 3.10
+        if: steps.release.outputs.changed == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install the release test environment
+        if: steps.release.outputs.changed == 'true'
+        id: install
+        continue-on-error: true
+        env:
+          UPSTREAM_SHA: ${{ steps.release.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            [[ "$(git -C .upstream/verl rev-parse HEAD)" == "$UPSTREAM_SHA" ]]
+            python -m pip install --upgrade pip
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+            python -m pip install -e .upstream/verl
+            python -m pip install pytest orjson
+            python -m pip install --no-deps -e .
+          } 2>&1 | tee .compat-work/install.log
+
+      - name: Run compatibility checks
+        if: steps.install.outcome == 'success'
+        id: checks
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python scripts/check_verl_api.py \
+            --verl-root .upstream/verl/verl \
+            --report .compat-work/api-report.md \
+            > .compat-work/api-check.log 2>&1
+          api_status=$?
+          VERL_USE_EXTERNAL_PLUGINS=none pytest -q -p no:cacheprovider tests \
+            > .compat-work/tests.log 2>&1
+          test_status=$?
+          cat .compat-work/api-check.log
+          cat .compat-work/tests.log
+          if [[ $api_status -ne 0 || $test_status -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Record compatibility result
+        if: always() && steps.release.outputs.changed == 'true'
+        id: result
+        env:
+          CHECK_OUTCOME: ${{ steps.checks.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+        shell: bash
+        run: |
+          status=infra_error
+          if [[ "$INSTALL_OUTCOME" == "failure" ]]; then
+            status=install_failed
+          elif [[ "$INSTALL_OUTCOME" == "success" && "$CHECK_OUTCOME" == "failure" ]]; then
+            status=incompatible
+          fi
+          if [[ "$INSTALL_OUTCOME" == "success" && "$CHECK_OUTCOME" == "success" ]]; then
+            status=compatible
+          fi
+          echo "install_outcome=${INSTALL_OUTCOME:-skipped}" >> "$GITHUB_OUTPUT"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "test_outcome=${CHECK_OUTCOME:-skipped}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload compatibility diagnostics
+        if: always() && steps.release.outputs.changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verl-compat-diagnostics
+          path: .compat-work
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+      - name: Fail an unsuccessful compatibility run
+        if: >-
+          always() && steps.release.outputs.changed == 'true' &&
+          steps.result.outputs.status != 'compatible'
+        shell: bash
+        run: |
+          echo "The exact verl release did not pass the compatibility gate." >&2
+          exit 1
+
+  publish:
+    needs: check_release
+    if: >-
+      needs.check_release.result == 'success' &&
+      needs.check_release.outputs.changed == 'true' &&
+      needs.check_release.outputs.status == 'compatible' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Check out the validated plugin base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.check_release.outputs.base_sha }}
+          fetch-depth: 0
+
+      - name: Refuse a stale compatibility result
+        env:
+          BASE_SHA: ${{ needs.check_release.outputs.base_sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          if [[ "$current_main" != "$BASE_SHA" ]]; then
+            echo "main advanced from $BASE_SHA to $current_main; a fresh compatibility run is required." >&2
+            exit 1
+          fi
+
+      - name: Update the validated release marker
+        env:
+          BRANCH: ${{ needs.check_release.outputs.branch }}
+          TAG: ${{ needs.check_release.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.check_release.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          commit = os.environ["UPSTREAM_SHA"]
+          branch = os.environ["BRANCH"]
+          if re.fullmatch(r"v?\d+\.\d+\.\d+(?:\.post\d+)?", tag) is None:
+              raise SystemExit(f"Unsafe release tag: {tag}")
+          if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+              raise SystemExit(f"Unsafe release commit: {commit}")
+          expected_branch = f"automation/verl-{tag}-{commit[:12]}"
+          if branch != expected_branch:
+              raise SystemExit(f"Unexpected publication branch: {branch}")
+          Path("compat/verl-release.json").write_text(
+              json.dumps({"tag": tag, "commit": commit}, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          git add -- compat/verl-release.json
+          unexpected="$(git diff --cached --name-only | grep -vx 'compat/verl-release.json' || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected staged files: $unexpected" >&2
+            exit 1
+          fi
+
+      - name: Commit and push the bot branch
+        env:
+          BASE_SHA: ${{ needs.check_release.outputs.base_sha }}
+          BRANCH: ${{ needs.check_release.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check_release.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.check_release.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -c "$BRANCH"
+          expected_tree="$(git write-tree)"
+          remote_sha="$(git ls-remote --heads origin "refs/heads/$BRANCH" | awk '{print $1}')"
+          if [[ -n "$remote_sha" ]]; then
+            git fetch --no-tags origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            remote_tree="$(git rev-parse "refs/remotes/origin/$BRANCH^{tree}")"
+            remote_parent="$(git rev-parse "refs/remotes/origin/$BRANCH^")"
+            remote_parent_count="$(
+              git rev-list --parents -n 1 "refs/remotes/origin/$BRANCH" | awk '{print NF - 1}'
+            )"
+            if [[ "$remote_parent" == "$BASE_SHA" && "$remote_tree" == "$expected_tree" ]]; then
+              echo "The existing bot branch already contains this validated marker."
+              exit 0
+            fi
+            remote_status="$(
+              git diff --name-status "$remote_parent" "refs/remotes/origin/$BRANCH"
+            )"
+            remote_author="$(
+              git show -s --format=%ae "refs/remotes/origin/$BRANCH"
+            )"
+            remote_marker="$(
+              git show "refs/remotes/origin/$BRANCH:compat/verl-release.json"
+            )"
+            if [[ "$remote_parent_count" != "1" ]] || \
+               ! git merge-base --is-ancestor "$remote_parent" "$BASE_SHA" || \
+               [[ "$remote_status" != $'M\tcompat/verl-release.json' ]] || \
+               [[ "$remote_author" != "41898282+github-actions[bot]@users.noreply.github.com" ]]; then
+              echo "The reserved bot branch contains unexpected commits; refusing to overwrite it." >&2
+              exit 1
+            fi
+            REMOTE_MARKER="$remote_marker" \
+              python3 -c \
+              'import json, os; value = json.loads(os.environ["REMOTE_MARKER"]); assert value == {"tag": os.environ["TAG"], "commit": os.environ["UPSTREAM_SHA"]}'
+          fi
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          if [[ "$current_main" != "$BASE_SHA" ]]; then
+            echo "main advanced before publication; refusing to push a stale marker." >&2
+            exit 1
+          fi
+          git commit -m "chore(compat): validate verl $TAG"
+          if [[ -n "$remote_sha" ]]; then
+            git push --force-with-lease="refs/heads/$BRANCH:$remote_sha" origin "HEAD:refs/heads/$BRANCH"
+          else
+            git push --set-upstream origin "$BRANCH"
+          fi
+
+      - name: Create or reopen the compatibility PR
+        id: publish_pr
+        env:
+          BASE_SHA: ${{ needs.check_release.outputs.base_sha }}
+          BRANCH: ${{ needs.check_release.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check_release.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.check_release.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          if [[ "$current_main" != "$BASE_SHA" ]]; then
+            echo "main advanced before PR publication; a fresh compatibility run is required." >&2
+            exit 1
+          fi
+          body="$RUNNER_TEMP/pr-body.md"
+          {
+            echo "## Summary"
+            echo
+            echo "Records compatibility with the stable verl tag \`$TAG\` (\`$UPSTREAM_SHA\`)."
+            echo
+            echo "- Static imported-API check: passed"
+            echo "- CPU unit tests against the exact release commit: passed"
+            echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "This PR is intentionally draft. Hardware validation and maintainer review still apply."
+          } > "$body"
+          pr_json="$(
+            gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
+              -f state=all \
+              -f head="$GITHUB_REPOSITORY_OWNER:$BRANCH" \
+              -f base=main \
+              -F per_page=100 \
+              --jq '.[0] // {}'
+          )"
+          number="$(jq -r '.number // empty' <<< "$pr_json")"
+          state="$(jq -r '.state // empty' <<< "$pr_json")"
+          merged_at="$(jq -r '.merged_at // empty' <<< "$pr_json")"
+          pr_url="$(jq -r '.html_url // empty' <<< "$pr_json")"
+          if [[ -z "$number" ]]; then
+            pr_url="$(gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(compat): validate verl $TAG" \
+              --body-file "$body" \
+              --draft)"
+          elif [[ -n "$merged_at" ]]; then
+            main_marker="$(
+              gh api --method GET "repos/$GITHUB_REPOSITORY/contents/compat/verl-release.json" \
+                -f ref=main --jq .content | tr -d '\n' | base64 --decode
+            )"
+            MAIN_MARKER="$main_marker" python3 -c \
+              'import json, os; value = json.loads(os.environ["MAIN_MARKER"]); assert value == {"tag": os.environ["TAG"], "commit": os.environ["UPSTREAM_SHA"]}'
+          else
+            if [[ "$state" == "closed" ]]; then
+              echo "Compatibility PR #$number was closed; refusing to reopen it automatically." >&2
+              exit 1
+            fi
+            gh pr edit "$number" \
+              --title "chore(compat): validate verl $TAG" \
+              --body-file "$body"
+          fi
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      - name: Close superseded compatibility PRs
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ needs.check_release.outputs.base_sha }}
+          BRANCH: ${{ needs.check_release.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check_release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          if [[ "$current_main" != "$BASE_SHA" ]]; then
+            echo "main advanced; leaving existing compatibility PRs unchanged."
+            exit 0
+          fi
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls?state=open&base=main&per_page=100" |
+            jq -r \
+              --arg branch "$BRANCH" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              '.[][] |
+               select(.head.repo.full_name == $repository) |
+               select(.head.ref | startswith("automation/verl-")) |
+               select(.head.ref != $branch) |
+               .number' |
+            while read -r number; do
+              [[ -z "$number" ]] && continue
+              gh pr close "$number" --comment "Superseded by the compatibility check for verl $TAG."
+            done
+
+      - name: Close a resolved compatibility issue
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ needs.check_release.outputs.base_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.publish_pr.outputs.pr_url }}
+          TAG: ${{ needs.check_release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          if [[ "$current_main" != "$BASE_SHA" ]]; then
+            echo "main advanced; leaving compatibility issues unchanged."
+            exit 0
+          fi
+          for title in "[compat] verl $TAG requires review" "[compat] verl release monitor failed"; do
+            number="$(
+              gh issue list --state open --search "$title in:title" --limit 100 --json number,title |
+                jq -r --arg title "$title" '.[] | select(.title == $title) | .number' |
+                head -n 1
+            )"
+            if [[ -n "$number" ]]; then
+              gh issue close "$number" \
+                --reason completed \
+                --comment "Resolved by the validated compatibility PR: $PR_URL"
+            fi
+          done
+
+  report:
+    needs: [check_release, publish]
+    if: >-
+      always() && github.ref == 'refs/heads/main' &&
+      (needs.check_release.result != 'success' ||
+       (needs.check_release.outputs.changed == 'true' && needs.publish.result != 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Create or update a compatibility issue
+        env:
+          CHECK_RESULT: ${{ needs.check_release.result }}
+          GH_TOKEN: ${{ github.token }}
+          INSTALL_OUTCOME: ${{ needs.check_release.outputs.install_outcome }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          STATUS: ${{ needs.check_release.outputs.status }}
+          TAG: ${{ needs.check_release.outputs.tag }}
+          TEST_OUTCOME: ${{ needs.check_release.outputs.test_outcome }}
+          UPSTREAM_SHA: ${{ needs.check_release.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ("$STATUS" == "incompatible" || "$STATUS" == "install_failed") && -n "$TAG" ]]; then
+            title="[compat] verl $TAG requires review"
+          else
+            title="[compat] verl release monitor failed"
+          fi
+          body="$RUNNER_TEMP/issue-body.md"
+          {
+            echo "The GitHub-hosted verl compatibility monitor could not publish a validated PR."
+            echo
+            if [[ -n "$TAG" ]]; then
+              echo "- Upstream release: \`$TAG\`"
+              echo "- Upstream commit: \`$UPSTREAM_SHA\`"
+            fi
+            echo "- Monitor job: \`${CHECK_RESULT:-unknown}\`"
+            echo "- Installation: \`${INSTALL_OUTCOME:-unknown}\`"
+            echo "- Compatibility checks: \`${TEST_OUTCOME:-unknown}\`"
+            echo "- Result: \`${STATUS:-unknown}\`"
+            echo "- PR publication: \`${PUBLISH_RESULT:-skipped}\`"
+            echo "- Diagnostics: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "Please inspect the diagnostics, adapt the plugin if necessary, and update"
+            echo "\`compat/verl-release.json\` only after the exact release passes validation."
+          } > "$body"
+          issue_json="$(
+            gh issue list --state all --search "$title in:title" --limit 100 --json number,state,title |
+              jq -c --arg title "$title" '[.[] | select(.title == $title)][0] // {}'
+          )"
+          number="$(jq -r '.number // empty' <<< "$issue_json")"
+          state="$(jq -r '.state // empty' <<< "$issue_json")"
+          if [[ -z "$number" ]]; then
+            gh issue create --title "$title" --body-file "$body"
+          else
+            if [[ "$state" == "CLOSED" || "$state" == "closed" ]]; then
+              gh issue reopen "$number"
+            fi
+            gh issue edit "$number" --title "$title" --body-file "$body"
+          fi

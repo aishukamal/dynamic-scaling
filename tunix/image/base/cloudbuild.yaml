@@ -1,0 +1,15 @@
+# Tunix atwigg/mlperf @65d021b base image (no Raiden wheel: the pinned tpu_sync_jax wheel bucket is private).
+# Dockerfile untouched; only an empty raiden_wheels/ dir was added (the Dockerfile COPYs it unconditionally).
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    env: ["DOCKER_BUILDKIT=1"]
+    args: ["build", "--build-arg", "INSTALL_MAXTEXT=false", "--build-arg", "INSTALL_RAIDEN=false", "--build-arg", "INSTALL_DEEPSWE_DEPS=false",
+           "-t", "us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-base", "-f", "Dockerfile", "."]
+  - id: smoke
+    name: gcr.io/cloud-builders/docker
+    args: ["run", "--rm", "us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-base", "bash", "-c",
+           "python -c \"import jax, vllm, tpu_inference, tunix; print('jax', jax.__version__, 'vllm', vllm.__version__)\" && python -c \"import tunix.experimental.distributed.runtime.discovery.discovery_service_pb2; import tunix.experimental.orchestrator.orchestrator\" && pip list 2>/dev/null | grep -i -E '^(jax|jaxlib|libtpu|vllm|tpu-inference|flax|transformers|torch) ' && echo SMOKE-OK"]
+images: ["us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-base"]
+timeout: 14400s
+options: {machineType: E2_HIGHCPU_32, diskSizeGb: 400}

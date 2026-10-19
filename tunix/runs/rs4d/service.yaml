@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rs4d-orch-metrics
+  namespace: default
+  labels: {app: tunix-exporter, run-prefix: "rs4d"}
+spec:
+  type: ClusterIP
+  selector: {jobset.sigs.k8s.io/jobset-name: rs4d-orch}
+  ports: [{name: metrics, port: 8852, targetPort: 8852}]

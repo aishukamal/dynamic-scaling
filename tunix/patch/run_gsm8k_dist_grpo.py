@@ -1,0 +1,750 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CPU control-plane for a minimal Orchestrator V2 GSM8K GRPO demo.
+
+The TPU worker processes host the expensive pieces:
+  1. a TrainerWorker backed by experimental PeftTrainer V2,
+  2. a vLLM RolloutWorker,
+  3. optionally an InferenceWorker for frozen reference log-probs.
+
+This process only owns Orchestrator V2 control flow. It registers remote worker
+handles with ClusterOrchestrator, configures the GRPO loss on the trainer
+worker,
+and executes StandardRLProgram through ClusterOrchestrator.run().
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Iterator
+import functools
+import logging
+import os
+import sys
+from typing import Any
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+import jax  # pylint: disable=g-import-not-at-top
+from transformers import AutoTokenizer  # pylint: disable=g-import-not-at-top
+
+REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+)
+if REPO_ROOT not in sys.path:
+  sys.path.insert(0, REPO_ROOT)
+
+from tunix.experimental.common import datatypes  # pylint: disable=g-import-not-at-top
+from tunix.experimental.distributed.runtime import context as runtime_context  # pylint: disable=g-import-not-at-top
+from tunix.experimental.examples.math_gsm8k_dist import gsm8k  # pylint: disable=g-import-not-at-top
+from tunix.experimental.orchestrator import algorithm_adapter  # pylint: disable=g-import-not-at-top
+from tunix.experimental.orchestrator import batch_assembly  # pylint: disable=g-import-not-at-top
+from tunix.experimental.orchestrator import orchestrator  # pylint: disable=g-import-not-at-top
+from tunix.experimental.orchestrator import rl_program  # pylint: disable=g-import-not-at-top
+from tunix.experimental.weight_sync import weight_sync  # pylint: disable=g-import-not-at-top
+from tunix.experimental.worker import remote_execution  # pylint: disable=g-import-not-at-top
+from tunix.rl import algorithm_config  # pylint: disable=g-import-not-at-top
+from tunix.sft import metrics_logger as metrics_logger_lib  # pylint: disable=g-import-not-at-top
+
+ProcessContext = runtime_context.ProcessContext
+
+
+def _int_list(value: str) -> tuple[int, ...]:
+  """Parses "512,2048" into (512, 2048)."""
+  return tuple(int(part) for part in value.split(",") if part)
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+  parser = argparse.ArgumentParser(
+      description="Orchestrator V2 Qwen3 GSM8K GRPO demo."
+  )
+  parser.add_argument(
+      "--batch_size",
+      type=int,
+      default=4,
+      help="Number of prompt groups per step.",
+  )
+  parser.add_argument(
+      "--mini_batch_size",
+      type=int,
+      default=None,
+      help=(
+          "Number of prompt groups per optimizer update. Defaults to"
+          " batch_size."
+      ),
+  )
+  parser.add_argument("--num_generations", type=int, default=8)
+  parser.add_argument("--max_steps", type=int, default=1)
+  parser.add_argument("--max_prompt_length", type=int, default=1024)
+  parser.add_argument("--max_response_length", type=int, default=1024)
+  parser.add_argument("--train_micro_batch_size", type=int, default=1)
+  parser.add_argument(
+      "--max_seq_token_per_tpu",
+      type=int,
+      default=None,
+      help=(
+          "Maximum sequence tokens per TPU for sequence packing. When"
+          " configured, SequencePackedBatchAssembler is used instead of"
+          " PaddedBatchAssembler."
+      ),
+  )
+  parser.add_argument(
+      "--max_segments_per_packed_row",
+      type=int,
+      default=None,
+      help="Maximum segments per packed row when sequence packing is enabled.",
+  )
+  # TODO(tunix-dev): Clean up worker specific configuration to orchestrator.
+  parser.add_argument(
+      "--trainer_fsdp",
+      type=int,
+      default=None,
+      help=(
+          "Trainer FSDP mesh dimension size for sequence packing pack_size"
+          " computation."
+      ),
+  )
+  parser.add_argument(
+      "--trainer_dp",
+      type=int,
+      default=None,
+      help=(
+          "Trainer DP mesh dimension size for sequence packing pack_size"
+          " computation."
+      ),
+  )
+  parser.add_argument(
+      "--trainer_expert",
+      type=int,
+      default=None,
+      help=(
+          "Trainer expert-parallel mesh dimension. Included in the sequence"
+          " packing row count because MaxText's MoE shards the batch axis over"
+          " ('fsdp','expert') jointly."
+      ),
+  )
+  parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-1.7B")
+  parser.add_argument("--tokenizer_path", type=str, default="")
+  parser.add_argument("--temperature", type=float, default=1.0)
+  parser.add_argument("--top_p", type=float, default=1.0)
+  parser.add_argument("--top_k", type=int, default=-1)
+  parser.add_argument(
+      "--beta",
+      type=float,
+      default=0.0,
+      help=(
+          "KL coefficient. Set to 0.04 with a reference inference worker to "
+          "match the Qwen3 GSM8K recipe."
+      ),
+  )
+  parser.add_argument("--epsilon", type=float, default=0.2)
+  parser.add_argument(
+      "--offpolicy",
+      "--max_staleness",
+      dest="max_staleness",
+      type=int,
+      default=os.getenv("MAX_STALENESS", 0),
+      help=(
+          "Maximum policy-version lag accepted by the async rollout queue. "
+          "0 means queue-level on-policy training."
+      ),
+  )
+  parser.add_argument(
+      "--trajectory_group_order",
+      choices=("arrival", "prompt_batch"),
+      default=os.getenv("TRAJECTORY_GROUP_ORDER", "arrival"),
+      help=(
+          "Trajectory group order."
+      ),
+  )
+  parser.add_argument(
+      "--rollout_replicas",
+      type=int,
+      default=1,
+      help="Number of rollout worker replicas to wait for.",
+  )
+  parser.add_argument(
+      "--max_concurrent_rollouts_per_worker",
+      type=int,
+      default=(
+          int(val)
+          if (val := os.getenv("MAX_CONCURRENT_ROLLOUTS_PER_WORKER", "").strip())
+          else None
+      )
+      or None,
+      help=(
+          "Optional cap on concurrent in-flight rollouts dispatched to any "
+          "single rollout worker."
+      ),
+  )
+  parser.add_argument(
+      "--weight_sync_mode",
+      type=weight_sync.WeightSyncMode,
+      default=weight_sync.WeightSyncMode(os.getenv("WEIGHT_SYNC_MODE", "none")),
+      choices=list(weight_sync.WeightSyncMode),
+      help=(
+          "Weight synchronization mode. 'none' disables post-update sync, "
+          "'raiden' uses Raiden, and 'fallback' runs protocol-only sync."
+      ),
+  )
+  parser.add_argument(
+      "--reward_mode",
+      choices=("env", "exact"),
+      default="env",
+      help=(
+          "env uses rollout environment rewards; exact recomputes the same "
+          "GSM8K reward in the orchestrator from returned trajectory text."
+      ),
+  )
+  parser.add_argument(
+      "--tfds_data_dir",
+      type=str,
+      default=os.getenv("TFDS_DATA_DIR", "/tmp/gsm8k_data"),
+  )
+  parser.add_argument("--tfds_split", type=str, default="train")
+  parser.add_argument("--seed", type=int, default=42)
+  parser.add_argument(
+      "--shuffle", action=argparse.BooleanOptionalAction, default=True
+  )
+  parser.add_argument(
+      "--log_dir",
+      type=str,
+      default=os.getenv("LOG_DIR", "/tmp/trellis_gsm8k"),
+      help="Directory for local event logging (TensorBoard/CLU).",
+  )
+  parser.add_argument(
+      "--trajectory_log_dir",
+      type=str,
+      default=os.getenv("TRAJECTORY_LOG_DIR", None),
+      help=(
+          "Directory for trajectory logging. Defaults to "
+          "<log_dir>/trajectories when log_dir is set."
+      ),
+  )
+  parser.add_argument(
+      "--flush_metrics_every_n_steps",
+      type=int,
+      default=1,
+      help="Frequency in steps to flush metrics logger.",
+  )
+  parser.add_argument(
+      "--wandb_project",
+      type=str,
+      default=os.getenv("WANDB_PROJECT", "trellis-gsm8k"),
+      help="W&B project name.",
+  )
+  parser.add_argument(
+      "--wandb_run_name",
+      type=str,
+      default=os.getenv("WANDB_RUN_NAME", ""),
+      help="W&B run name. Defaults to timestamp-based name if unset.",
+  )
+  parser.add_argument("--rpc_timeout_s", type=float, default=1800.0)
+  parser.add_argument(
+      "--disable_weight_sync_timeouts",
+      action=argparse.BooleanOptionalAction,
+      default=os.getenv(
+          "WEIGHT_SYNC_DISABLE_TIMEOUTS",
+          os.getenv("DISABLE_WEIGHT_SYNC_TIMEOUTS", "0"),
+      ).strip().lower()
+      in ("1", "true", "yes", "on"),
+      help=(
+          "Disable all weight-sync phase timeouts and weight-sync gRPC "
+          "timeouts (sets them to infinity)."
+      ),
+  )
+  parser.add_argument("--init_timeout_s", type=float, default=None)
+  parser.add_argument("--inference_addr", type=str, default="")
+  parser.add_argument(
+      "--stop_workers_on_exit",
+      action="store_true",
+      help=(
+          "Send a graceful gRPC stop to every remote worker when the"
+          " orchestrator exits."
+      ),
+  )
+  parser.add_argument(
+      "--use_rollout_logps",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "Use rollout sampler log-probs as old_per_token_logps (off-policy /"
+          " sampler importance ratio). Default True matches the"
+          " non-experimental GRPOConfig; pass --no-use_rollout_logps for"
+          " on-policy ratio=1."
+      ),
+  )
+  # ---- Optional GRPO algorithm options -------------------------------------
+  # All default to off, so omitting them reproduces the previous behaviour.
+  parser.add_argument(
+      "--epsilon_high", type=float, default=None,
+      help="Upper PPO clip bound, for DAPO-style asymmetric clipping.",
+  )
+  parser.add_argument(
+      "--loss_agg_mode", type=str, default="sequence-mean-token-mean",
+      help="Loss aggregation mode, e.g. token-mean or sequence-mean.",
+  )
+  parser.add_argument(
+      "--advantage_estimator", type=str, default="grpo",
+      help="Advantage estimator, e.g. grpo or grpo-loo (leave-one-out).",
+  )
+  parser.add_argument(
+      "--overlong_loss_masking", action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Drop sequences truncated by the response budget from the loss AND"
+          " its denominator. Needs the rollout to report a trajectory status."
+      ),
+  )
+  parser.add_argument(
+      "--seq_logprob_error_threshold", type=float, default=None,
+      help=(
+          "Drop sequences whose mean exp|log p_trainer - log q_sampler|"
+          " exceeds this. Requires rollout log-probabilities."
+      ),
+  )
+  parser.add_argument(
+      "--truncated_importance_sampling_type", type=str, default=None,
+      choices=(None, "seq-mask-tis"),
+      help="Set to seq-mask-tis to enable the sequence-mask TIS gate.",
+  )
+  parser.add_argument(
+      "--truncated_importance_sampling_ratio_min", type=float, default=None,
+      help="Lower edge of the TIS keep band.",
+  )
+  parser.add_argument(
+      "--truncated_importance_sampling_ratio", type=float, default=None,
+      help="Upper edge of the TIS keep band.",
+  )
+  parser.add_argument(
+      "--sampler_is_length_buckets", type=_int_list, default=None,
+      help=(
+          "Comma-separated completion-length bucket edges in tokens, e.g."
+          " 512,2048. Reports the sampler/trainer offset per bucket."
+      ),
+  )
+  parser.add_argument(
+      "--debug",
+      action="store_true",
+      help="Enable debug logging and print full sampler responses.",
+  )
+  parser.add_argument(
+      "--trajectory_store_root_dir",
+      "--trajectory_store_root",
+      dest="trajectory_store_root_dir",
+      type=str,
+      default=os.getenv(
+          "TRAJECTORY_STORE_ROOT_DIR",
+          os.getenv("TRAJECTORY_STORE_ROOT", ""),
+      ),
+      help="Root directory for the file-backed TrajectoryStore.",
+  )
+  parser.add_argument(
+      "--trajectory_store_db_url",
+      type=str,
+      default=os.getenv("TRAJECTORY_STORE_DB_URL", ""),
+      help=(
+          "SQLAlchemy database URL for the SQL-backed TrajectoryStore (e.g."
+          " 'sqlite:////path/to/store.db' or"
+          " 'postgresql+psycopg2://user:pass@host:5432/dbname')."
+      ),
+  )
+  return parser.parse_args(argv)
+
+
+def _build_trajectory_store_config(
+    args: argparse.Namespace,
+) -> list[dict[str, Any] | None] | None:
+  """Builds the [file_store, sql_store] TrajectoryStore configuration list."""
+  root_dir = (args.trajectory_store_root_dir or "").strip()
+  db_url = (args.trajectory_store_db_url or "").strip()
+  file_cfg = (
+      {"enabled": True, "backend": "file", "root_dir": root_dir}
+      if root_dir
+      else None
+  )
+  sql_cfg = (
+      {"enabled": True, "backend": "sql", "db_url": db_url}
+      if db_url
+      else None
+  )
+  if file_cfg is None and sql_cfg is None:
+    return None
+  return [file_cfg, sql_cfg]
+
+
+def _build_algo(args: argparse.Namespace) -> algorithm_adapter.GRPOAdapter:
+  algo_config = algorithm_config.GRPOConfig(
+      num_generations=args.num_generations,
+      epsilon=args.epsilon,
+      epsilon_high=args.epsilon_high,
+      beta=args.beta,
+      temperature=args.temperature,
+      use_rollout_logps=args.use_rollout_logps,
+      loss_agg_mode=args.loss_agg_mode,
+      advantage_estimator=args.advantage_estimator,
+      overlong_loss_masking=args.overlong_loss_masking,
+      seq_logprob_error_threshold=args.seq_logprob_error_threshold,
+      truncated_importance_sampling_type=(
+          args.truncated_importance_sampling_type
+      ),
+      truncated_importance_sampling_ratio_min=(
+          args.truncated_importance_sampling_ratio_min
+      ),
+      truncated_importance_sampling_ratio=(
+          args.truncated_importance_sampling_ratio
+      ),
+      sampler_is_length_buckets=args.sampler_is_length_buckets,
+  )
+  return algorithm_adapter.GRPOAdapter(
+      algo_config=algo_config,
+      mini_batch_size=args.mini_batch_size,
+      train_micro_batch_size=args.train_micro_batch_size,
+      max_packed_len=(
+          args.max_seq_token_per_tpu
+          if args.max_seq_token_per_tpu is not None
+          else args.max_prompt_length + args.max_response_length
+      ),
+      max_response_length=args.max_response_length,
+  )
+
+
+def _build_prompt_item(
+    *,
+    example: dict[str, Any],
+    prompt_idx: int,
+) -> dict[str, Any]:
+  prompt = gsm8k.as_text(example["prompts"])
+  question = gsm8k.as_text(example["question"])
+  answer = gsm8k.normalize_example_value(example["answer"])
+  prompt_id = f"prompt_{prompt_idx}"
+  return {
+      "prompt": prompt,
+      "prompt_id": prompt_id,
+      "metadata": {
+          "answer": answer,
+          "gold_answer": answer,
+          "question": question,
+          "env_config": {
+              "prompt": prompt,
+              "prompts": prompt,
+              "prompt_id": prompt_id,
+              "question": question,
+              "answer": answer,
+              "gold_answer": answer,
+              "max_steps": 1,
+          },
+      },
+  }
+
+
+def _iter_prompt_items(
+    args: argparse.Namespace,
+) -> Iterator[dict[str, Any]]:
+  dataset = gsm8k.load_gsm8k_dataset(
+      split=args.tfds_split,
+      data_dir=args.tfds_data_dir,
+      shuffle=args.shuffle,
+      seed=args.seed,
+  )
+  dataset_size = len(dataset)
+  if dataset_size == 0:
+    raise ValueError("GSM8K dataset is empty.")
+  for prompt_idx in range(args.max_steps * args.batch_size):
+    example = dataset[prompt_idx % dataset_size]
+    assert example is not None
+    yield _build_prompt_item(
+        example=example,
+        prompt_idx=prompt_idx,
+    )
+
+
+def main(argv: list[str], context: ProcessContext | None = None) -> None:
+  assert (
+      context and context.ipc and context.ipc.discovery
+  ), "Require discovery API, but process context doesn't support."
+
+  logging.basicConfig(
+      level=logging.INFO,
+      format="%(asctime)s - [Orchestrator] %(message)s",
+      force=True,
+  )
+
+  args = _parse_args(argv)
+  if args.debug:
+    # Enable canonical debug logging and print full sampler responses
+    logging.getLogger().setLevel(logging.DEBUG)
+  if args.mini_batch_size is None:
+    args.mini_batch_size = args.batch_size
+  if args.num_generations <= 1:
+    raise ValueError("num_generations must be greater than 1 for GRPO.")
+  if args.batch_size <= 0:
+    raise ValueError("batch_size must be positive.")
+  if args.max_staleness < 0:
+    raise ValueError("offpolicy/max_staleness must be non-negative.")
+
+  logging.info("=== Starting Distributed GSM8K GRPO Orchestrator ===")
+  logging.info(
+      "Configuration: model_id=%s, batch_size=%d (prompt groups), "
+      "mini_batch_size=%d, num_generations=%d (%d rollouts/step), "
+      "max_steps=%d, train_micro_batch_size=%d, beta=%.4f, epsilon=%.2f, "
+      "reward_mode=%s, max_staleness=%d, weight_sync_mode=%s.",
+      args.model_id,
+      args.batch_size,
+      args.mini_batch_size,
+      args.num_generations,
+      args.batch_size * args.num_generations,
+      args.max_steps,
+      args.train_micro_batch_size,
+      args.beta,
+      args.epsilon,
+      args.reward_mode,
+      args.max_staleness,
+      args.weight_sync_mode,
+  )
+  logging.info("Control-plane JAX backend: %s", jax.default_backend())
+  logging.info(
+      "Dataset: GSM8K split=%s data_dir=%s reward_mode=%s.",
+      args.tfds_split,
+      args.tfds_data_dir,
+      args.reward_mode,
+  )
+
+  tokenizer_path = (
+      args.tokenizer_path or os.getenv("MODEL_DIR") or args.model_id
+  )
+  tokenizer = AutoTokenizer.from_pretrained(
+      tokenizer_path, trust_remote_code=True
+  )
+  if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+    tokenizer.pad_token = tokenizer.eos_token
+  pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+  eos_id = (
+      tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+  )
+  logging.info(
+      "Loaded tokenizer from %s (vocab_size=%d, pad_id=%d, eos_id=%d).",
+      tokenizer_path,
+      len(tokenizer),
+      pad_id,
+      eos_id,
+  )
+
+  if args.disable_weight_sync_timeouts:
+    os.environ["WEIGHT_SYNC_DISABLE_TIMEOUTS"] = "1"
+    logging.info(
+        "Weight-sync timeouts disabled via --disable_weight_sync_timeouts."
+    )
+  cluster = orchestrator.ClusterOrchestrator(
+      weight_sync_mode=args.weight_sync_mode,
+      trajectory_store_config=_build_trajectory_store_config(args),
+      disable_weight_sync_timeouts=args.disable_weight_sync_timeouts,
+      jax_cache_config={
+          "save_jax_cache": os.getenv("SAVE_JAX_CACHE", "true").lower() in ("1", "true", "yes"),
+          "jax_cache_gcs_dir": os.getenv("JAX_CACHE_GCS_DIR"),
+          "rollout_jax_cache_gcs_dir": os.getenv("ROLLOUT_JAX_CACHE_GCS_DIR"),
+      },
+      max_concurrent_rollouts_per_worker=(
+          args.max_concurrent_rollouts_per_worker
+      ),
+  )
+  context.ipc.discovery.on_register(
+      functools.partial(
+          cluster.register_worker_from_hostname,
+          rpc_timeout_s=args.rpc_timeout_s,
+      )
+  )
+
+  # --- TUNIX-BASELINE observability patch (console-only; no algorithm change) ---
+  import time as _time  # pylint: disable=g-import-not-at-top
+
+  def _console_metric(name, value, **kw):
+    try:
+      logging.info("METRIC step=%s %s=%s", kw.get("step"), name, float(value))
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.info("METRIC step=%s %s=%r", kw.get("step"), name, value)
+
+  jax.monitoring.register_scalar_listener(_console_metric)
+
+  def _membership_listener(worker_id, state):
+    logging.info(
+        "MEMBERSHIP t=%.3f worker_id=%s state=%s",
+        _time.time(),
+        worker_id,
+        getattr(state, "value", state),
+    )
+
+  cluster.registry.add_state_listener(_membership_listener)
+
+  # --- TUNIX-CONTROLLER exporter (in-process HTTP :TUNIX_EXPORTER_PORT, /metrics /status; read-only) ---
+  from tunix.experimental.examples.math_gsm8k_dist import tunix_exporter as _tunix_exporter  # pylint: disable=g-import-not-at-top
+  _exporter = _tunix_exporter.Exporter(
+      cluster,
+      port=int(os.getenv("TUNIX_EXPORTER_PORT", "8787")),
+      run_name=os.getenv("TUNIX_RUN_NAME", ""),
+  )
+  jax.monitoring.register_scalar_listener(_exporter.on_scalar)
+  cluster.registry.add_state_listener(_exporter.on_membership)
+  _exporter.serve()
+  # --- end exporter ---
+
+  def _ft_snapshot(step):
+    try:
+      eng = cluster.engine
+      states = {
+          wid: cluster.registry.state(wid).value
+          for wid in cluster.registry.worker_ids(include_evicted=True)
+      }
+      n_active = len(getattr(eng, "_rollout_workers", []) or []) if eng else -1
+      ftm = eng.fault_tolerance_metrics if eng else {}
+      logging.info(
+          "FTSNAP step=%s t=%.3f active_rollout_workers=%d states=%s ft=%s",
+          step,
+          _time.time(),
+          n_active,
+          states,
+          ftm,
+      )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logging.info("FTSNAP step=%s error=%r", step, e)
+  # --- end patch ---
+
+  logging.info("Waiting for workers to register via discovery service...")
+  cluster.wait_for_workers(
+      min_workers={
+          datatypes.Role.ACTOR: 1,
+          datatypes.Role.ROLLOUT: args.rollout_replicas,
+          datatypes.Role.REFERENCE: 1 if args.beta != 0.0 else 0,
+      },
+      timeout=args.init_timeout_s,
+      poll_interval_s=1.0,
+  )
+  logging.info("Registered Orchestrator V2 workers: %s", cluster.worker_infos())
+
+  algo = _build_algo(args)
+
+  metrics_logging_options = metrics_logger_lib.MetricsLoggerOptions(
+      log_dir=args.log_dir,
+      project_name=args.wandb_project,
+      run_name=args.wandb_run_name,
+      flush_every_n_steps=args.flush_metrics_every_n_steps,
+      backend_kwargs={
+          "wandb": {
+              "config": vars(args),
+          }
+      },
+  )
+
+  reward_fns = (
+      [gsm8k.make_gsm8k_reward_fn(debug=args.debug)]
+      if args.reward_mode == "exact"
+      else []
+  )
+  generation_args = datatypes.GenerationArgs(
+      temperature=args.temperature,
+      top_p=args.top_p,
+      top_k=None if args.top_k < 0 else args.top_k,
+      return_logprobs=True,
+  )
+  program = rl_program.StandardRLProgram(
+      algo=algo,
+      dataset=_iter_prompt_items(args),
+      max_steps=args.max_steps,
+      reward_fns=reward_fns,
+      generation_args=generation_args,
+      batch_size=args.batch_size,
+      batch_config=batch_assembly.BatchConfig(
+          pad_id=pad_id,
+          max_prompt_length=args.max_prompt_length,
+          max_response_length=args.max_response_length,
+          max_seq_token_per_tpu=args.max_seq_token_per_tpu,
+          max_segments_per_packed_row=args.max_segments_per_packed_row,
+          trainer_fsdp=args.trainer_fsdp,
+          trainer_dp=args.trainer_dp,
+          trainer_expert=args.trainer_expert,
+      ),
+      metrics_logging_options=metrics_logging_options,
+      trajectory_log_dir=args.trajectory_log_dir,
+      trajectory_store=cluster.trajectory_store,
+      max_staleness=args.max_staleness,
+      group_order=args.trajectory_group_order,
+      sync_weights=(args.weight_sync_mode != "none"),
+      on_step_begin=lambda step: (
+          logging.info(
+              ">>> Step %d starting | Policy Version: %d | t=%.3f",
+              step,
+              step,
+              _time.time(),
+          ),
+          _ft_snapshot(step),
+          _exporter.on_step_begin(step),
+      ),
+      on_step_end=lambda step, result: (
+          logging.info(
+              "<<< Step %d finished | Advanced to Policy Version: %d | t=%.3f",
+              step,
+              step + 1,
+              _time.time(),
+          ),
+          _ft_snapshot(step),
+          _exporter.on_step_end(step),
+      ),
+  )
+
+  try:
+    logging.info("Bringing up remote workers through ClusterOrchestrator...")
+    cluster.bring_up_workers(dummy_data=None)
+    logging.info(
+        "Cluster workers ready: %s. Starting StandardRLProgram execution...",
+        [w.worker_id for w in cluster.worker_infos()],
+    )
+    cluster.run(
+        program=program,
+        num_steps=args.max_steps,
+        bring_up=False,
+    )
+  except BaseException as exc:
+    logging.exception("FATAL: StandardRLProgram execution failed: %s", exc)
+    raise
+  finally:
+    program.close()
+    if args.stop_workers_on_exit:
+      logging.info("Shutting down cluster workers...")
+      cluster.shutdown()
+    else:
+      cluster.monitor.close()
+
+  result = program.last_step_result
+  if result is not None:
+    logging.info(
+        "=== GRPO Training Finished Successfully ===\n"
+        "  Final step: %d\n"
+        "  Final policy version: %d\n"
+        "  Total rollouts: %d\n"
+        "  Total microbatches: %d\n"
+        "  Final step reward: mean=%.4f, std=%.4f",
+        result.step,
+        result.policy_version,
+        result.num_rollouts,
+        result.num_microbatches,
+        result.reward_mean,
+        result.reward_std,
+    )
+  else:
+    logging.info("=== GRPO Training Finished (No step results) ===")
+
+
+if __name__ == "__main__":
+  main(sys.argv[1:])

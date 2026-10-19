@@ -1,0 +1,138 @@
+--- /Users/aishuk/workspaces/tunix-poc/examples/deepswe/swe_agent.py	2026-10-14 15:45:57
++++ swe_agent.py	2026-10-16 15:12:32
+@@ -83,7 +83,57 @@
+ 
+ TOKEN_WARNING_THRESHOLD = 28000
+ 
++# ---------------------------------------------------------------- TUNIX-REWARD2 additions (env-controlled, default off)
++import json as _json  # noqa: E402
++import time as _time  # noqa: E402
++try:
++  from examples.deepswe import r2_toolcall as _r2tc  # pytype: disable=import-error
++except Exception:  # noqa: BLE001
++  try:
++    import r2_toolcall as _r2tc  # type: ignore
++  except Exception:  # noqa: BLE001
++    _r2tc = None
++_TOOLCALL_MODE = os.getenv("TOOLCALL_MODE", "").strip().lower()          # "" (stock) | "qwen_json"
++_STRIP_THINK = os.getenv("STRIP_THINK", "0") in ("1", "true", "True")    # drop <think>...</think> from history
++_TOOL_ROLE = os.getenv("TOOLCALL_TOOL_ROLE", "1") in ("1", "true", "True")  # tool results as role=tool in qwen_json mode
++_TRAJ_DUMP_DIR = os.getenv("TRAJ_DUMP_DIR", "").strip()
++_TERSE_PROMPT = os.getenv("TERSE_PROMPT", "0") in ("1", "true", "True")  # arm B: tool call only, at most one short sentence
++_TERSE_TEXT = (
++    "Response style: reply with the tool call only, preceded by at most one short sentence. Do not restate the task,"
++    " do not write plans or summaries, do not explain what you are about to do."
++)
++_DUMP_FH = None
+ 
++
++def _dump(rec: dict) -> None:
++  """Append one JSON record per model turn / env turn to TRAJ_DUMP_DIR/turns-<pid>.jsonl (hostPath on the rollout node)."""
++  global _DUMP_FH
++  if not _TRAJ_DUMP_DIR:
++    return
++  try:
++    if _DUMP_FH is None:
++      os.makedirs(_TRAJ_DUMP_DIR, exist_ok=True)
++      _DUMP_FH = open(os.path.join(_TRAJ_DUMP_DIR, f"turns-{os.getpid()}.jsonl"), "a", buffering=1)
++    rec["t"] = _time.time()
++    _DUMP_FH.write(_json.dumps(rec, ensure_ascii=False, default=str) + "\n")
++  except Exception:  # noqa: BLE001
++    pass
++
++
++def _qwen_json_system_prompt(base: str) -> str:
++  out = base.rstrip() + "\n\n" + _r2tc.tools_block()
++  if _TERSE_PROMPT:
++    out += "\n\n" + _TERSE_TEXT
++  return out
++
++
++def _strip_think(text: str) -> str:
++  if "</think>" in text:
++    return text.split("</think>", 1)[1].lstrip("\n")
++  return text
++# ---------------------------------------------------------------- end additions
++
++
+ def multi_tool_calls_enabled() -> bool:
+   """Whether CodeActAgent runs every tool call of a turn, like OpenHands.
+ 
+@@ -360,6 +410,15 @@
+     self.user_prompt_template = get_user_prompt_template(
+         scaffold=scaffold, use_fn_calling=use_fn_calling
+     )
++    if _TOOLCALL_MODE == "qwen_json" and _r2tc is not None and scaffold == "r2egym":
++      # Qwen3 native function calling: short system text + the template's "# Tools" block; the user prompt
++      # variant without the XML format instructions
++      system_prompt = _qwen_json_system_prompt(
++          get_system_prompt(scaffold=scaffold, use_fn_calling=True)
++      )
++      self.user_prompt_template = get_user_prompt_template(
++          scaffold=scaffold, use_fn_calling=True
++      )
+ 
+     super().__init__(system_prompt)
+     agent_key = (
+@@ -436,13 +495,21 @@
+             "</function>\n"
+         )
+ 
++    _dump({"kind": "env", "agent": id(self), "step": self.step, "done": bool(done), "reward": reward,
++           "obs_len": len(observation), "observation": observation[:4000],
++           "cur_tokens": (info or {}).get("cur_tokens")})  # engine's per-episode token count after this turn
+     super().update_from_env(observation, reward, done, info)
+     self.cur_step = Step(observation=observation)
+ 
+   def _observation_to_messages(
+       self, observation: Any, reward: float, done: bool, info: dict[str, Any]
+   ) -> None:
+-
++    # qwen_json mode: tool results go back as role=tool (rendered by the Qwen chat parser as a <tool_response>
++    # block inside a user turn, as Qwen3's own template does); the first observation (the task) stays a user turn
++    if (_TOOLCALL_MODE == "qwen_json" and _TOOL_ROLE and getattr(self, "scaffold", "") == "r2egym"
++        and len(self._trajectory.steps) > 0):
++      self._messages.append({"role": "tool", "content": str(observation)})
++      return
+     self._messages.append({"role": "user", "content": str(observation)})
+ 
+   def _parse_model_response(
+@@ -467,10 +534,27 @@
+         Action: The action produced by the agent.
+     """
+     self._trajectory.steps.append(self.cur_step)
+-    thought, action = self._parse_model_response(response)
++    parse_info: dict[str, Any] = {}
++    if _TOOLCALL_MODE == "qwen_json" and _r2tc is not None and not self.use_fn_calling:
++      thought, tool, params, parse_info = _r2tc.parse_qwen_json(response)
++      if not tool:
++        # fall back to the scaffold's XML parser, then map aliases (view/create/submit...) onto the real tools
++        thought_x, action_x = self._parse_model_response(response)
++        fn = getattr(action_x, "function_name", "") or ""
++        if fn:
++          tool, params, info2 = _r2tc.normalize(fn, dict(getattr(action_x, "parameters", {}) or {}))
++          parse_info = dict(info2, format="xml_fallback")
++          thought = thought_x
++      action = SWEAction(tool, params) if tool else SWEAction("", {})
++    else:
++      thought, action = self._parse_model_response(response)
+     action_str = (
+         action.to_xml_string() if getattr(action, "function_name", True) else ""
+     )
++    _dump({"kind": "model", "agent": id(self), "step": self.step, "response": (response or "")[:6000],
++           "resp_len": len(response or ""), "fn": getattr(action, "function_name", ""),
++           "params": dict(getattr(action, "parameters", {}) or {}), "parse": parse_info,
++           "n_messages": len(self._messages)})
+ 
+     # Update Trajectory
+     cur_step = self._trajectory.steps[-1]
+@@ -484,7 +568,8 @@
+           {"role": "assistant", "content": f"{thought}\n\n{action_str}"}
+       )
+     else:
+-      self._messages.append({"role": "assistant", "content": response})
++      self._messages.append({"role": "assistant",
++                             "content": _strip_think(response) if _STRIP_THINK else response})
+     self.step += 1
+     return Action(action=cur_step.action)
+ 

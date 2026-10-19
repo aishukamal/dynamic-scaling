@@ -1,0 +1,38 @@
+hydra:
+  searchpath:
+    - pkg://verl.experimental.fully_async_policy.config
+    - pkg://verl.trainer.config
+
+defaults:
+  - fully_async_ppo_trainer
+  - _self_
+
+# Elastic standalone sampler pool (rl_pool_autoscaler plugin). All keys optional.
+rl_pool:
+  # Active standalone replicas at launch and the floor the controller may scale in to (>= 1).
+  min_standalone: 1
+  # Ceiling for the controller. With prestart=true, size rollout.nnodes x rollout.n_gpus_per_node
+  # so that exactly max_standalone replicas are created at launch (warm engines).
+  max_standalone: 8
+  # true: create every replica the rollout GPU budget allows at launch and park all but
+  # min_standalone (out of LB, engine paused, memory held). false: start with the stock count and
+  # cold-start new replicas on scale-out.
+  prestart: true
+  # HTTP port of the control actor (bound on the Ray head node).
+  control_port: 8787
+  control_actor_name: rl_pool_control
+  # false: scale-in parks the replica (warm). true: scale-in destroys actors + placement group.
+  release_on_scale_in: false
+  # clean_only: a joiner-only weight sync runs only while actor weights equal the last synced
+  # version; otherwise the attached joiner rides the next regular sync. immediate: always sync.
+  joiner_sync_mode: clean_only
+  join_timeout_s: 3600
+  join_poll_s: 5
+  scale_timeout_s: 1800
+  status_timeout_s: 30
+
+async_training:
+  # Hybrid (trainer-GPU) scheduling stays OFF: the controller owns capacity decisions.
+  use_dynamic_resource_scheduling: false
+  use_trainer_do_validate: false
+  partial_rollout: true

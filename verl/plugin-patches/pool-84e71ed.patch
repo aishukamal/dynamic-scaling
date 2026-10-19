@@ -1,0 +1,63 @@
+From 84e71edccf0c08fa9b5100cd244c168002a89b30 Mon Sep 17 00:00:00 2001
+From: Aishu Kamal <aishuk@google.com>
+Date: Fri, 16 Oct 2026 20:08:35 -0700
+Subject: [PATCH] tpu pool control: one spawn decision at a time (early-spawn
+ poller vs detection-time replacement raced into two spawns)
+
+---
+ .../tpu/engines/tpu_pool_control.py           | 25 +++++++++++--------
+ 1 file changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+index 51f8b24..548647a 100644
+--- a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
++++ b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+@@ -123,6 +123,7 @@ class PoolHook:
+         # (_join_on_ready) and a detection-time repair (_repair_dead_now). _actor_updated_pending marks "update_actor of
+         # this step finished, its sync has not run yet", which is the only case where the clean version is last+1.
+         self._sync_lock = threading.Lock()
++        self._spawn_gate = threading.Lock()  # one spawn decision at a time (early-spawn poller vs detection-time repair)
+         self._actor_busy = False
+         self._actor_updated_pending = False
+         self._trainer_blocked_s = 0.0
+@@ -421,12 +422,13 @@ class PoolHook:
+         except Exception as e:  # noqa: BLE001
+             self.log("desired_error", error=repr(e)[:200], source="repair")
+             return
+-        with self._lock:
+-            have = len(self.active) + len(self.parked) + len(self.spawn_ready)
+-        if desired > have and self.cfg.get("spawn", False) and not self.spawning:
+-            if self.next_rank < int(self.cfg.get("max_rank", 8)):
+-                self.log("replacement_spawn", desired=desired, have=have, dead_rank=rank)
+-                self.start_spawn(t_request=t0)
++        with self._spawn_gate:  # the early-spawn poller takes the same gate, so only one of them starts the replacement
++            with self._lock:
++                have = len(self.active) + len(self.parked) + len(self.spawn_ready)
++            if desired > have and self.cfg.get("spawn", False) and not self.spawning:
++                if self.next_rank < int(self.cfg.get("max_rank", 8)):
++                    self.log("replacement_spawn", desired=desired, have=have, dead_rank=rank)
++                    self.start_spawn(t_request=t0)
+             else:
+                 self.log("spawn_refused", reason="max_rank reached", next_rank=self.next_rank)
+ 
+@@ -910,11 +912,12 @@ class PoolHook:
+             try:
+                 if self.initial_done and not self.spawning:
+                     desired = int(ray.get(self.ctrl.get_desired.remote(), timeout=10))
+-                    with self._lock:
+-                        have = len(self.active) + len(self.parked) + len(self.spawn_ready)
+-                    if desired > have and self.next_rank < int(self.cfg.get("max_rank", 8)):
+-                        self.log("early_spawn", desired=desired, active=len(self.active), spawn_ready=len(self.spawn_ready))
+-                        self.start_spawn(t_request=self._desired_since(desired))
++                    with self._spawn_gate:
++                        with self._lock:
++                            have = len(self.active) + len(self.parked) + len(self.spawn_ready)
++                        if desired > have and not self.spawning and self.next_rank < int(self.cfg.get("max_rank", 8)):
++                            self.log("early_spawn", desired=desired, active=len(self.active), spawn_ready=len(self.spawn_ready))
++                            self.start_spawn(t_request=self._desired_since(desired))
+             except Exception as e:  # noqa: BLE001
+                 logger.warning(f"[POOL] early spawn poller: {e}")
+             time.sleep(poll)
+-- 
+2.56.0.rc1.315.gc6ed9934b7-goog
+

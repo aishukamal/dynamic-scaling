@@ -1,0 +1,61 @@
+From 3a4b8e1f445f027531b7d81abec375a41041178a Mon Sep 17 00:00:00 2001
+From: Aishu Kamal <aishuk@google.com>
+Date: Fri, 16 Oct 2026 22:05:22 -0700
+Subject: [PATCH] tpu platform: derive a pool's TPU mesh from the pod type of
+ its own nodes, not the first TPU node in ray.nodes() (mixed v6e-8 trainer /
+ v6e-4 sampler clusters)
+
+---
+ .../accelerators/tpu/platform_tpu.py          | 21 +++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/verl_hardware_plugin/accelerators/tpu/platform_tpu.py b/verl_hardware_plugin/accelerators/tpu/platform_tpu.py
+index a1c524c..97b37a9 100644
+--- a/verl_hardware_plugin/accelerators/tpu/platform_tpu.py
++++ b/verl_hardware_plugin/accelerators/tpu/platform_tpu.py
+@@ -641,8 +641,10 @@ class PlatformTPU(PlatformBase):
+         creates the workers (the trainer's TaskRunner), so nothing here may depend on the IP of
+         the calling process -- it can be the head node or any TPU host.
+         """
+-        node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive", False)}
++        alive_nodes = [node for node in ray.nodes() if node.get("Alive", False)]
++        node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in alive_nodes}
+         bundle_ips = []
++        pool_node_ids: list = []
+ 
+         for pg in pgs:
+             specs = ray._private.state.state.placement_group_table(pg.id)
+@@ -653,6 +655,8 @@ class PlatformTPU(PlatformBase):
+                 node_id = bundles_map[b_idx]
+                 if node_id in node_ip_map:
+                     bundle_ips.append(node_ip_map[node_id])
++                    if node_id not in pool_node_ids:
++                        pool_node_ids.append(node_id)
+ 
+         base_port = TPU_PROCESS_BASE_PORT
+         sb_addresses = [f"{ip}:{base_port + (b_idx % local_world_size)}" for b_idx, ip in enumerate(bundle_ips)]
+@@ -672,9 +676,18 @@ class PlatformTPU(PlatformBase):
+             "TPU_VISIBLE_DEVICES": str(local_rank),
+         }
+ 
+-        # Derive the mesh from the pod type Ray reports, falling back to the chip count.
+-        tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
+-        tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
++        # Derive the mesh from the pod type of the nodes that host THIS pool's bundles. Taking the first TPU node of
++        # ray.nodes() instead made the result depend on node ordering in mixed clusters (an 8-chip v6e-8 trainer host
++        # next to v6e-4 sampler hosts): with a v6e-4 node first, the 8-process trainer got 2x2 bounds and libtpu failed
++        # with "Expected 4 worker addresses, got 8" (TPU-M3 recipe-2 runs on 6nw8 and cb1q). Falls back to the first
++        # TPU node, then to the chip count.
++        tpu_nodes = [node for node in alive_nodes if "TPU" in node.get("Resources", {})]
++        pool_nodes = [node for node in tpu_nodes if node.get("NodeID") in pool_node_ids]
++        tpu_type = ""
++        for node in pool_nodes or tpu_nodes:
++            tpu_type = node.get("Labels", {}).get("ray.io/tpu-pod-type", "")
++            if tpu_type:
++                break
+ 
+         topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
+             total_chips=world_size,
+-- 
+2.56.0.rc1.315.gc6ed9934b7-goog
+

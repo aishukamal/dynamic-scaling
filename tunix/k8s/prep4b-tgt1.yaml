@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Pod
+metadata: {name: rc-prep4b-tgt1, namespace: default, labels: {app: rc-prep}}
+spec:
+  restartPolicy: Never
+  nodeSelector: {kubernetes.io/hostname: gke-tpu-7fb5c8f1-tgt1}
+  tolerations: [{key: google.com/tpu, operator: Exists, effect: NoSchedule}, {key: cloud.google.com/gke-spot, operator: Exists, effect: NoSchedule}]
+  containers:
+  - name: main
+    image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-deepswe-raiden-20261015035906
+    command: ["bash", "-c", "set -e; export HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0; python -c \"import agent_sandbox_rl, tpu_sync; print('prepull ok')\"; python -c \"from huggingface_hub import snapshot_download; p=snapshot_download('Qwen/Qwen3-4B', local_dir='/tmp/tunix-models/Qwen3-4B'); print(p)\"; du -sh /tmp/tunix-models/Qwen3-4B; echo PREP-DONE"]
+    volumeMounts: [{name: tmp, mountPath: /tmp}]
+  volumes: [{name: tmp, hostPath: {path: /tmp, type: DirectoryOrCreate}}]

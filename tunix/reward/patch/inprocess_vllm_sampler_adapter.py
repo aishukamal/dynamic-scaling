@@ -1,0 +1,460 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""In-process vLLM Sampler adapter integrating with Tunix VllmSampler."""
+
+import abc
+import asyncio
+from concurrent import futures
+import functools
+import threading
+from typing import Any, List, Sequence
+from absl import logging
+from flax import nnx
+import jax
+import numpy as np
+from tunix.experimental.rollout import sampler as base_sampler_lib
+from tunix.experimental.rollout.raiden_weight_sync_mixin import (
+    RaidenDestinationWeightSyncMixin,
+)
+from tunix.experimental.weight_sync import weight_sync
+from tunix.generate import tokenizer_adapter as tok_adapter
+from tunix.generate import utils as generate_utils
+
+Sampler = base_sampler_lib.Sampler
+
+
+def _get_vllm_sampler_cls():
+  """Lazy import of tunix.generate.vllm_sampler to avoid top-level vLLM import side-effects."""
+  from tunix.generate import vllm_sampler as generate_vllm_lib  # pylint: disable=g-import-not-at-top
+
+  return generate_vllm_lib
+
+
+class InprocessVllmSamplerAdapter(
+    RaidenDestinationWeightSyncMixin, Sampler, abc.ABC
+):
+  """Sampler adapter wrapping Tunix VllmSampler."""
+
+  def __init__(
+      self,
+      server_id: str,
+      tokenizer: Any = None,
+      config: Any = None,
+      model_name: str = "",
+      raiden_sync_delegate: Any = None,
+      weight_sync_mode: weight_sync.WeightSyncMode | str | None = None,
+      max_concurrency: int = 256,
+      **kwargs,
+  ):
+    self.server_id = server_id
+    if tokenizer is not None and not isinstance(
+        tokenizer, tok_adapter.TokenizerAdapter
+    ):
+      try:
+        tokenizer = tok_adapter.TokenizerAdapter(tokenizer)
+      except ValueError:
+        pass
+    self.tokenizer = tokenizer
+    self.config = config
+    self.model_name = model_name or kwargs.get("model", "")
+    self.vllm_sampler = None
+    self.raiden_sync_delegate = raiden_sync_delegate
+    self.max_concurrency = max_concurrency
+    self._executor = futures.ThreadPoolExecutor(
+        max_workers=self.max_concurrency,
+        thread_name_prefix=f"{self.server_id}_vllm_worker",
+    )
+    if weight_sync_mode is None:
+      weight_sync_mode = getattr(config, "weight_sync_mode", None)
+    if isinstance(weight_sync_mode, weight_sync.WeightSyncMode):
+      self.weight_sync_mode = weight_sync_mode
+    elif isinstance(weight_sync_mode, str):
+      self.weight_sync_mode = weight_sync.WeightSyncMode(weight_sync_mode)
+    else:
+      self.weight_sync_mode = weight_sync.DEFAULT_WEIGHT_SYNC_MODE
+    self.enable_raiden = (
+        self.weight_sync_mode == weight_sync.WeightSyncMode.RAIDEN
+    )
+
+    if self.enable_raiden:
+      logging.info(
+          "InprocessVllmSamplerAdapter [%s] weight_sync: initializing Raiden"
+          " delegate",
+          self.server_id,
+      )
+
+      if self.raiden_sync_delegate is None:
+        from tunix.experimental.weight_sync import raiden_weight_sync_delegate  # pylint: disable=g-import-not-at-top
+
+        self.raiden_sync_delegate = (
+            raiden_weight_sync_delegate.RaidenWeightSyncDelegate(
+                server_id=self.server_id
+            )
+        )
+
+    if not self.enable_raiden and self.raiden_sync_delegate:
+      logging.warning(
+          "InprocessVllmSamplerAdapter [%s] raiden_sync_delegate is set but"
+          " enable_raiden is False.",
+          self.server_id,
+      )
+
+    # NOTE: Instantiation of self.vllm_sampler is deferred to initialize()
+    # to ensure model graph compilation, KV cache allocation, and precompile
+    # warm-up occur strictly within the MLPerf [init_start, init_stop] window.
+
+  @property
+  def is_initialized(self) -> bool:
+    """Returns True if the underlying vLLM sampler engine has been initialized."""
+    return self.vllm_sampler is not None
+
+  def _get_underlying_sampler(self) -> Any:
+    if self.vllm_sampler is None and (
+        self.tokenizer is not None or self.model_name
+    ):
+      self.initialize()
+    return self.vllm_sampler
+
+  def initialize(self) -> None:
+    """Initializes vLLM sampler if needed."""
+    if self.tokenizer is None and self.model_name:
+      from transformers import AutoTokenizer  # pylint: disable=g-import-not-at-top
+      from tunix.generate import vllm_sampler as tunix_vllm_sampler  # pylint: disable=g-import-not-at-top
+
+      self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+      self.config = tunix_vllm_sampler.VllmConfig(
+          server_mode=True,
+          engine_kwargs={"model": self.model_name},
+      )
+
+    if (
+        self.vllm_sampler is None
+        and self.tokenizer is not None
+        and self.config is not None
+    ):
+      # Required for thread-safe continuous batching across `self._executor`
+      # worker threads; see comment in `__init__`.
+      self.config.server_mode = True
+      vllm_lib = _get_vllm_sampler_cls()
+      self.vllm_sampler = vllm_lib.VllmSampler(
+          tokenizer=self.tokenizer, config=self.config
+      )
+
+  def _prompt_tokens_from_request(
+      self,
+      req: Any,
+      fallback_padded_tokens: Any,
+      prompt_length: int | None = None,
+  ) -> np.ndarray:
+    """Returns request token ids directly when available, else sampler output."""
+    prompt = req.prompt if hasattr(req, "prompt") else req
+    if generate_utils.is_token_id_sequence(prompt):
+      return np.asarray(prompt, dtype=np.int32).reshape(-1)
+    return generate_utils.unpad_prompt_tokens(
+        fallback_padded_tokens,
+        pad_id=self.tokenizer.pad_id() if self.tokenizer is not None else None,
+        prompt_length=prompt_length,
+    )
+
+  def _prompt_to_input_string(self, prompt: Any) -> Any:
+    """Renders chat-message prompts to strings for Tunix VllmSampler."""
+    if isinstance(prompt, str):
+      return prompt
+    if isinstance(prompt, (list, tuple)) and all(
+        isinstance(message, dict) for message in prompt
+    ):
+      if hasattr(self.tokenizer, "apply_chat_template"):
+        return self.tokenizer.apply_chat_template(
+            list(prompt), tokenize=False, add_generation_prompt=True
+        )
+      return "\n".join(str(message.get("content", "")) for message in prompt)
+    return prompt
+
+  # --- Lifecycle & Topology ---
+  async def start(self, **kwargs) -> str | None | Any:
+    """Starts the sampling engine or local loop."""
+    del kwargs
+    if self.vllm_sampler is None:
+      self.initialize()
+    return True
+
+  async def stop(self, **kwargs) -> str | None | Any:
+    """Terminates sampler execution and closes local connections."""
+    del kwargs
+    if self._executor is not None:
+      self._executor.shutdown(wait=False, cancel_futures=True)
+    if self.vllm_sampler and hasattr(self.vllm_sampler, "stop"):
+      self.vllm_sampler.stop()
+    return True
+
+  async def pause(self, **kwargs) -> str | None | Any:
+    """Pauses inference processing on this worker slice."""
+    del kwargs
+    return True
+
+  async def resume(self, **kwargs) -> str | None | Any:
+    """Resumes inference processing on this worker slice."""
+    del kwargs
+    return True
+
+  async def get_mesh(self, **kwargs) -> Any:
+    """Returns the underlying device mesh topology."""
+    del kwargs
+    if self.vllm_sampler and hasattr(self.vllm_sampler, "mesh"):
+      return self.vllm_sampler.mesh
+    return None
+
+  # --- Inference ---
+  async def sample(
+      self,
+      sampling_requests: (
+          base_sampler_lib.SamplingRequest
+          | Sequence[base_sampler_lib.SamplingRequest]
+          | Any
+          | Sequence[Any]
+      ),
+      **kwargs,
+  ) -> (
+      base_sampler_lib.SamplingResponse
+      | List[base_sampler_lib.SamplingResponse]
+      | Any
+  ):
+    """Generates completions using underlying Tunix VllmSampler."""
+    if not self.vllm_sampler:
+      if self.tokenizer is not None or self.model_name:
+        self.initialize()
+      if not self.vllm_sampler:
+        raise RuntimeError(
+            f"InprocessVllmSamplerAdapter [{self.server_id}] vllm_sampler is not"
+            " initialized."
+        )
+
+    if sampling_requests is None:
+      raise ValueError("sampling_requests cannot be None.")
+
+    if isinstance(sampling_requests, base_sampler_lib.SamplingRequest):
+      requests: List[Any] = [sampling_requests]
+      is_sequence = False
+    elif isinstance(sampling_requests, (list, tuple)):
+      requests = list(sampling_requests)
+      is_sequence = True
+    else:
+      requests = [sampling_requests]
+      is_sequence = False
+
+    prompts = []
+    prompt_token_ids_batch = []
+    has_token_prompts = False
+    max_gen_steps_list = []
+    temps = []
+    top_ps = []
+    top_ks = []
+    seeds = []
+    return_logprobs_list = []
+    return_routed_experts_list = []
+    routed_experts_prompt_start_list = []
+
+    for req in requests:
+      prompt = req.prompt if hasattr(req, "prompt") else req
+      if generate_utils.is_token_id_sequence(prompt):
+        has_token_prompts = True
+        prompt_token_ids_batch.append(
+            np.asarray(prompt, dtype=np.int32).reshape(-1)
+        )
+      else:
+        prompts.append(self._prompt_to_input_string(prompt))
+      sp = (
+          req.sampling_params
+          if hasattr(req, "sampling_params") and req.sampling_params is not None
+          else base_sampler_lib.SamplingParams()
+      )
+      assert sp is not None
+
+      max_gen_steps_list.append(sp.max_tokens)
+      temps.append(sp.temperature)
+      top_ps.append(sp.top_p)
+      top_ks.append(sp.top_k)
+      seeds.append(sp.seed)
+      return_logprobs_list.append(sp.return_logprobs)
+      return_routed_experts_list.append(sp.return_routed_experts)
+      routed_experts_prompt_start_list.append(
+          getattr(sp, "routed_experts_prompt_start", 0)
+      )
+
+    max_generation_steps = max(max_gen_steps_list) if max_gen_steps_list else 64
+    temperature = temps[0] if temps else 0.0
+    top_p = top_ps[0] if top_ps else None
+    top_k = top_ks[0] if top_ks else None
+    seed = seeds[0] if seeds else None
+    return_logprobs = any(return_logprobs_list) or kwargs.get(
+        "return_logprobs", False
+    )
+    routed_experts_prompt_start = (
+        routed_experts_prompt_start_list
+        if routed_experts_prompt_start_list
+        else kwargs.get("routed_experts_prompt_start", 0)
+    )
+    # Capture is an engine-level vLLM setting, so it cannot be turned on
+    # per request. Warn rather than silently handing back None routing, which
+    # would look like a dense model to the trainer.
+    if any(return_routed_experts_list) and not getattr(
+        self.vllm_sampler.config, "return_routed_experts", False
+    ):
+      logging.warning(
+          "InprocessVllmSamplerAdapter [%s]: routed experts were requested per"
+          " request, but the vLLM engine was built without"
+          " return_routed_experts, so none will be returned. Set"
+          " return_routed_experts on the sampler's VllmConfig.",
+          self.server_id,
+      )
+
+    loop = asyncio.get_running_loop()
+    sampler_call_kwargs = dict(
+        max_generation_steps=max_generation_steps,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed,
+        return_logprobs=return_logprobs,
+        routed_experts_prompt_start=routed_experts_prompt_start,
+    )
+    if has_token_prompts:
+      sampler_call_kwargs["input_strings"] = None
+      sampler_call_kwargs["prompt_token_ids"] = prompt_token_ids_batch
+    else:
+      sampler_call_kwargs["input_strings"] = prompts
+    try:  # TUNIX-REWARD measurement log (first 3 generate calls per worker)
+      self._gencall_n = getattr(self, "_gencall_n", 0) + 1
+      if self._gencall_n <= 3:
+        _p0 = prompts[0] if prompts else None
+        _t0 = prompt_token_ids_batch[0] if prompt_token_ids_batch else None
+        logging.info(
+            "GENCALL n=%d reqs=%d token_prompts=%s temperature=%r top_p=%r"
+            " top_k=%r max_gen=%r logprobs=%r prompt0_len=%s prompt0_head=%r"
+            " prompt0_tail=%r token_prompt0_len=%s token_prompt0_tail=%r",
+            self._gencall_n, len(requests), has_token_prompts, temperature,
+            top_p, top_k, max_generation_steps, return_logprobs,
+            (len(_p0) if isinstance(_p0, str) else None),
+            (_p0[:400] if isinstance(_p0, str) else None),
+            (_p0[-400:] if isinstance(_p0, str) else None),
+            (len(_t0) if _t0 is not None else None),
+            (list(_t0[-12:]) if _t0 is not None else None),
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
+
+    cancel_event = threading.Event()
+    submitted_request_ids: list[str] = []
+    sampler_call_kwargs["cancel_event"] = cancel_event
+    sampler_call_kwargs["request_ids_out"] = submitted_request_ids
+    try:
+      sampler_output = await loop.run_in_executor(
+          self._executor,
+          functools.partial(self.vllm_sampler, **sampler_call_kwargs),
+      )
+    except asyncio.CancelledError:
+      cancel_event.set()
+      self.vllm_sampler.cancel_requests(submitted_request_ids)
+      raise
+
+    try:  # TUNIX-REWARD measurement log
+      if getattr(self, "_gencall_n", 0) <= 3:
+        _t = sampler_output.text
+        _tx0 = _t[0] if isinstance(_t, list) and _t else _t
+        _tk = sampler_output.tokens
+        _tk0 = _tk[0] if isinstance(_tk, list) and _tk else None
+        logging.info(
+            "GENOUT n=%d text0_len=%s ntok0=%s last_tokens=%r text0=%r",
+            self._gencall_n,
+            (len(_tx0) if isinstance(_tx0, str) else None),
+            (len(_tk0) if _tk0 is not None else None),
+            (list(_tk0[-6:]) if _tk0 is not None else None),
+            (_tx0[:700] if isinstance(_tx0, str) else None),
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
+    prompt_lengths = getattr(sampler_output, "prompt_lengths", None)
+    responses = []
+    for i, req in enumerate(requests):
+      req_id = getattr(req, "request_id", "")
+
+      txt = (
+          sampler_output.text[i]
+          if isinstance(sampler_output.text, list)
+          else sampler_output.text
+      )
+      toks = (
+          sampler_output.tokens[i]
+          if isinstance(sampler_output.tokens, list)
+          else sampler_output.tokens
+      )
+      lps = None
+      if sampler_output.logprobs and isinstance(sampler_output.logprobs, list):
+        lps = sampler_output.logprobs[i]
+
+      routed_list = getattr(sampler_output, "routed_experts", None) or []
+      routed = routed_list[i] if i < len(routed_list) else None
+
+      tok_ids = (
+          np.array(toks, dtype=np.int32)
+          if toks is not None
+          else np.zeros(0, dtype=np.int32)
+      )
+      prompt_len = (
+          int(prompt_lengths[i])
+          if prompt_lengths is not None and i < len(prompt_lengths)
+          else None
+      )
+      prompt_token_ids = self._prompt_tokens_from_request(
+          req, sampler_output.padded_prompt_tokens[i], prompt_length=prompt_len
+      )
+      log_ps = np.array(lps, dtype=np.float32) if lps is not None else None
+
+      responses.append(
+          base_sampler_lib.SamplingResponse(
+              request_id=req_id,
+              text=txt,
+              prompt_token_ids=prompt_token_ids,
+              token_ids=tok_ids,
+              logprobs=log_ps,
+              routed_experts=routed,
+              finish_reason="stop",
+          )
+      )
+
+    if is_sequence:
+      return responses
+    return responses[0]
+
+  async def get_transfer_status(self, req_id: str | Any, **kwargs) -> str | Any:
+    """Queries status of an ongoing weight transfer or KV-cache migration."""
+    del req_id, kwargs
+    return "SUCCESS"
+
+  async def migrate_kv_cache(
+      self,
+      source_server_id: str,
+      target_server_id: str,
+      token_ids: List[int],
+      **kwargs,
+  ) -> bool:
+    """Triggers KV-cache transfer across TPU slices."""
+    del source_server_id, target_server_id, token_ids, kwargs
+    return True
+
+  async def get_load_info(self, **kwargs) -> base_sampler_lib.LoadInfo:
+    """Returns best-effort vLLM queue/cache load information."""
+    del kwargs
+    return base_sampler_lib.LoadInfo()

@@ -1,0 +1,1132 @@
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/tpu_checkpoint_engine.py b/verl_hardware_plugin/accelerators/tpu/engines/tpu_checkpoint_engine.py
+index fbc8c50..97aceda 100644
+--- a/verl_hardware_plugin/accelerators/tpu/engines/tpu_checkpoint_engine.py
++++ b/verl_hardware_plugin/accelerators/tpu/engines/tpu_checkpoint_engine.py
+@@ -645,8 +645,9 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
+                 if self.backend == "tpu":
+                     return await update_tpu_weights(self, global_steps=global_steps)
+                 if self.backend == "raiden":
+-                    # late_join_spike.update_weights == update_raiden_weights unless VERL_TPU_LATE_JOIN_SPIKE is set.
+-                    from verl_hardware_plugin.accelerators.tpu.engines.late_join_spike import update_weights
++                    # tpu_pool_control.update_weights == update_raiden_weights unless VERL_TPU_POOL_CONTROL (controller
++                    # hook) or VERL_TPU_LATE_JOIN_SPIKE (schedule driver) is set.
++                    from verl_hardware_plugin.accelerators.tpu.engines.tpu_pool_control import update_weights
+ 
+                     return await update_weights(self, global_steps=global_steps)
+                 res = _orig_mgr_update(self, global_steps=global_steps)
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_actor.py b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_actor.py
+new file mode 100644
+index 0000000..c7094b6
+--- /dev/null
++++ b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_actor.py
+@@ -0,0 +1,283 @@
++# Copyright (c) 2026 Google LLC. All rights reserved.
++# Licensed under the Apache License, Version 2.0.
++
++"""Control endpoint of the TPU sampler pool (experiment, out of tree). Standard library + ray only.
++
++A named Ray actor (``tpu_pool_control``) that holds the desired standalone replica count and the latest
++state the trainer-side hook (``tpu_pool_control.PoolHook``) reports, and serves it over HTTP so the
++Kubernetes-side controller (``rl_pool_autoscaler.controller.main``) can run unchanged:
++
++    GET  /metrics   Prometheus text: rl_pool_* series (names the controller reads)
++    GET  /status    JSON: replica sets, versions, trainer metrics, events, spawns
++    POST /scale     {"standalone": N} -> desired count (clamped to [min, max]); the hook applies ONE move per sync
++
++This module is imported by the actor process (the Ray head, no TPU), so it must not import torch/tpu modules.
++"""
++
++import http.server
++import json
++import threading
++import time
++from typing import Any
++
++
++def _fmt(v: Any) -> str:
++    if v is None:
++        return "NaN"
++    if isinstance(v, bool):
++        return "1" if v else "0"
++    if isinstance(v, int):
++        return str(v)
++    try:
++        return repr(float(v))
++    except (TypeError, ValueError):
++        return "NaN"
++
++
++class PoolControlState:
++    """State + HTTP server. Wrapped with ``ray.remote`` by the hook that creates it."""
++
++    def __init__(self, cfg: dict):
++        self.cfg = dict(cfg)
++        self.min = int(cfg.get("min", 1))
++        self.max = int(cfg.get("max", 8))
++        self.lock = threading.Lock()
++        self.desired = int(cfg.get("initial_active", 1))
++        self.report: dict[str, Any] = {}
++        self.trainer: dict[str, Any] = {}
++        self.trainer_step: int | None = None
++        self.history: list[tuple[int, dict]] = []
++        self.window = int(cfg.get("window_steps", 2))
++        self.mq_history: list[tuple[int, float]] = []
++        self.events: list[dict] = []
++        self.scale_requests: list[dict] = []
++        self.t0 = time.time()
++        self.port = int(cfg.get("port", 8787))
++        # Product path (TPU-M3): scale-in releases (destroys) the replica instead of parking it when the controller asks
++        # for it (POST /scale {"release": true}); the Kubernetes actuator reads the Ray node inventory from /status.
++        self.release = bool(cfg.get("release_on_scale_in", False))
++        self.rollout_group = str(cfg.get("rollout_group", "tpu-group-1"))
++        self._serve()
++
++    # ------------------------------------------------------------------ ray-facing API (hook side)
++    def set_report(self, report: dict) -> None:
++        with self.lock:
++            self.report = dict(report)
++            if report.get("sampleable") is not None and report.get("n_sync") is not None:
++                self.mq_history.append((int(report["n_sync"]), float(report["sampleable"])))
++                self.mq_history = self.mq_history[-8:]
++
++    def set_trainer_metrics(self, step: int, metrics: dict) -> None:
++        with self.lock:
++            self.trainer_step = int(step)
++            self.trainer = dict(metrics)
++            self.history.append((int(step), dict(metrics)))
++            self.history = self.history[-8:]
++
++    def push_event(self, event: dict) -> None:
++        with self.lock:
++            self.events.append(event)
++            if len(self.events) > 5000:
++                self.events = self.events[-4000:]
++
++    def get_desired(self) -> int:
++        with self.lock:
++            return self.desired
++
++    def set_desired(self, n: int, source: str = "api", release: bool | None = None) -> dict:
++        n = max(self.min, min(self.max, int(n)))
++        with self.lock:
++            prev = self.desired
++            self.desired = n
++            if release is not None:
++                self.release = bool(release)
++            rec = {"t": time.time(), "desired": n, "prev": prev, "source": source, "release": self.release}
++            self.scale_requests.append(rec)
++        return rec
++
++    def get_release(self) -> bool:
++        with self.lock:
++            return self.release
++
++    def _ray_nodes(self) -> list:
++        """Alive Ray nodes with their TPU totals and (best effort) available TPUs, in the shape the GPU-M2 Kubernetes
++        actuator reads (gpu_total / gpu_available / rollout_node): a sampler pod that joined Ray shows up as a rollout
++        node with gpu_available == gpu_total until a replica's placement group takes its chips."""
++        try:
++            import ray
++            from ray._private import state as _state
++
++            avail = dict(_state.available_resources_per_node() or {})
++            nodes = ray.nodes()
++        except Exception as e:  # noqa: BLE001
++            return [{"error": repr(e)[:200]}]
++        out = []
++        for n in nodes:
++            if not n.get("Alive"):
++                continue
++            res = n.get("Resources") or {}
++            a = avail.get(n["NodeID"], {})
++            out.append({
++                "node_id": n["NodeID"], "ip": n.get("NodeManagerAddress"), "hostname": n.get("NodeManagerHostname"),
++                "gpu_total": res.get("TPU", 0), "gpu_available": (a.get("TPU", 0.0) if a else None),
++                "rollout_node": res.get(self.rollout_group, 0), "trainer_node": res.get("tpu-group-0", 0),
++                "head": "node:__internal_head__" in res,
++            })
++        return out
++
++    def ping(self) -> float:
++        return time.time()
++
++    # ------------------------------------------------------------------ HTTP views
++    def metrics_text(self) -> str:
++        with self.lock:
++            rep = dict(self.report)
++            tr = dict(self.trainer)
++            step = self.trainer_step
++            desired = self.desired
++        active = list(rep.get("active", []))
++        parked = list(rep.get("parked", []))
++        dead = list(rep.get("dead", []))
++        step_s = tr.get("timing_s/step")
++        gen_s = tr.get("timing_s/gen")
++        idle_last = (float(gen_s) / float(step_s)) if step_s and gen_s is not None and float(step_s) > 0 else None
++        # The separate_async trainer prefetches one batch, so wait and queue fill alternate with a 2-step period
++        # (e.g. 38 s / 0 s). The controller reads the ratio over the last ``window_steps`` steps (sum of waits over
++        # sum of step walls) and the queue fill as the mean sampleable count over the same window.
++        with self.lock:
++            hist = [m for _s, m in self.history[-self.window :]]
++            mqh = [v for _s, v in self.mq_history[-self.window :]]
++        num = sum(float(m.get("timing_s/gen", 0.0)) for m in hist)
++        den = sum(float(m.get("timing_s/step", 0.0)) for m in hist)
++        idle = (num / den) if den > 0 else idle_last
++        mq_win = (sum(mqh) / len(mqh)) if mqh else rep.get("sampleable", 0)
++        pending_repair = bool(rep.get("pending_repair", False))
++        spawning = bool(rep.get("spawning", False))
++        in_progress = (desired != len(active)) or pending_repair or spawning
++        lines = []
++
++        def g(name: str, value: Any, labels: dict | None = None, help_: str = "") -> None:
++            if help_:
++                lines.append(f"# HELP {name} {help_}")
++                lines.append(f"# TYPE {name} gauge")
++            lab = ""
++            if labels:
++                lab = "{" + ",".join(f'{k}="{v}"' for k, v in labels.items()) + "}"
++            lines.append(f"{name}{lab} {_fmt(value)}")
++
++        g("rl_pool_active_standalone_replicas", len(active), help_="active standalone replicas (in LB + membership)")
++        g("rl_pool_sleeping_standalone_replicas", len(parked), help_="parked replicas (asleep level 2)")
++        g("rl_pool_dead_replicas", len(dead), help_="replicas detected dead by the watchdog")
++        g("rl_pool_desired_standalone_replicas", desired, help_="desired count (POST /scale)")
++        g("rl_pool_scaling_in_progress", 1 if in_progress else 0, help_="desired != active, repair pending or spawn in flight")
++        if step is not None:
++            g("rl_pool_current_param_version", step, help_="trainer step of the last logged metrics")
++            g("rl_pool_trainer_idle_ratio", idle, help_="sum(timing_s/gen)/sum(timing_s/step) over the last window_steps steps")
++            g("rl_pool_trainer_idle_ratio_last", idle_last, help_="timing_s/gen / timing_s/step of the last logged step")
++            g("rl_pool_trainer_wait_s", gen_s, help_="timing_s/gen of the last step")
++            g("rl_pool_trainer_step_s", step_s, help_="timing_s/step of the last step")
++            g("rl_pool_trainer_update_actor_s", tr.get("timing_s/update_actor"))
++            g("rl_pool_trainer_update_weights_s", tr.get("timing_s/update_weights"))
++            g("rl_pool_reward_mean", tr.get("critic/score/mean"))
++            g("rl_pool_response_length_mean", tr.get("response_length/mean"))
++            g("rl_pool_throughput_tok_s", tr.get("perf/throughput"))
++            g("rl_pool_trainer_idle_ratio_ema", rep.get("idle_ema"))
++        g("rl_pool_mq_size", mq_win, help_="mean sampleable prompt groups at sync time over the last window_steps syncs")
++        g("rl_pool_mq_size_last", rep.get("sampleable", 0), help_="prompt groups already sampleable for the next step at the last sync")
++        g("rl_pool_max_queue_size", rep.get("train_batch_size", 0), help_="prompt groups per step (train_batch_size)")
++        g("rl_pool_last_sync_wall_s", rep.get("last_sync_wall_s"), help_="wall of the last Raiden sync (hook-measured)")
++        g("rl_pool_last_sync_index", rep.get("n_sync"))
++        g("rl_pool_last_sync_version", rep.get("last_sync_version"))
++        g("rl_pool_lb_total_inflight", sum((rep.get("inflight") or {}).values()) if rep.get("inflight") else 0)
++        # Slot utilization (TPU-M3): the controller's gate computes slot_util = rollout_resource_utilization x
++        # max_concurrent_samples / (active x concurrent_samples_per_replica); exported so that it equals the time-weighted
++        # decode-slot occupancy of the last step window (LB in-flight requests over active x max_num_seqs, clamped to 1).
++        util = rep.get("util") or {}
++        traj = rep.get("traj") or {}
++        cap = rep.get("slot_cap") or 0
++        g("rl_pool_rollout_resource_utilization", util.get("decode_slot_util"),
++          help_="time-weighted mean of min(1, lb_inflight / (active x max_num_seqs)) over the last step window")
++        g("rl_pool_max_concurrent_samples", len(active) * cap if cap else None, help_="active replicas x max_num_seqs")
++        g("rl_pool_concurrent_samples_per_replica", cap or None, help_="vLLM max_num_seqs per replica (slot cap)")
++        g("rl_pool_decode_slot_util", util.get("decode_slot_util"))
++        g("rl_pool_share_slots_full", util.get("share_slots_full"), help_="share of the window with lb_inflight >= active x cap")
++        g("rl_pool_lb_inflight_mean", util.get("lb_inflight_mean"))
++        g("rl_pool_util_window_s", util.get("window_s"))
++        g("rl_pool_active_tasks", traj.get("traj_inflight"), help_="trajectories in flight at the last step log (TQ running groups x n minus finished)")
++        g("rl_pool_running_groups", traj.get("running_groups"))
++        g("rl_pool_pending_groups", traj.get("pending_groups"))
++        g("rl_pool_traj_slot_ratio", traj.get("traj_slot_ratio"), help_="trajectories in flight / (active x max_num_seqs), unclamped")
++        for rank, n in (rep.get("inflight") or {}).items():
++            g("rl_pool_replica_inflight_requests", n, {"replica": str(rank), "address": str((rep.get("addresses") or {}).get(str(rank), ""))})
++        for rank, v in (rep.get("versions") or {}).items():
++            g("rl_pool_replica_param_version", v, {"replica": str(rank)})
++        g("rl_pool_uptime_s", time.time() - self.t0, help_="seconds since the control actor started")
++        return "\n".join(lines) + "\n"
++
++    def status(self) -> dict:
++        nodes = self._ray_nodes()
++        with self.lock:
++            rep = dict(self.report)
++            addr = rep.get("addresses") or {}
++            pool = {k: [{"rank": r, "address": addr.get(str(r))} for r in (rep.get(k) or [])] for k in ("active", "parked", "dead")}
++            return {
++                "cfg": self.cfg,
++                "desired": self.desired,
++                "release": self.release,
++                "trainer_step": self.trainer_step,
++                "trainer": self.trainer,
++                "report": rep,
++                "pool": pool,
++                "nodes": nodes,
++                "scale_requests": self.scale_requests[-50:],
++                "events": self.events[-400:],
++                "uptime_s": time.time() - self.t0,
++            }
++
++    def _serve(self) -> None:
++        state = self
++
++        class Handler(http.server.BaseHTTPRequestHandler):
++            def log_message(self, *args):  # quiet
++                return
++
++            def _send(self, code: int, body: str, ctype: str = "text/plain; version=0.0.4"):
++                data = body.encode()
++                self.send_response(code)
++                self.send_header("Content-Type", ctype)
++                self.send_header("Content-Length", str(len(data)))
++                self.end_headers()
++                self.wfile.write(data)
++
++            def do_GET(self):
++                if self.path.startswith("/metrics"):
++                    self._send(200, state.metrics_text())
++                elif self.path.startswith("/status"):
++                    self._send(200, json.dumps(state.status(), default=str), "application/json")
++                elif self.path.startswith("/healthz"):
++                    self._send(200, "ok")
++                else:
++                    self._send(404, "not found")
++
++            def do_POST(self):
++                if not self.path.startswith("/scale"):
++                    self._send(404, "not found")
++                    return
++                n = int(self.headers.get("Content-Length") or 0)
++                raw = self.rfile.read(n).decode() if n else "{}"
++                try:
++                    body = json.loads(raw or "{}")
++                    target = int(body["standalone"])
++                except (ValueError, KeyError, TypeError) as e:
++                    self._send(400, json.dumps({"error": f"bad body: {e}"}), "application/json")
++                    return
++                rel = body.get("release")
++                rec = state.set_desired(target, source="api", release=(bool(rel) if rel is not None else None))
++                rep = state.report
++                rec = dict(rec, active=len(rep.get("active", [])), parked=len(rep.get("parked", [])))
++                self._send(200, json.dumps(rec), "application/json")
++
++        self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
++        self.httpd.daemon_threads = True
++        th = threading.Thread(target=self.httpd.serve_forever, name="pool-http", daemon=True)
++        th.start()
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+new file mode 100644
+index 0000000..d00cfae
+--- /dev/null
++++ b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+@@ -0,0 +1,754 @@
++# Copyright (c) 2026 Google LLC. All rights reserved.
++# Licensed under the Apache License, Version 2.0.
++
++"""TPU sampler-pool control hook (experiment driver, out of tree): the TPU-M1 late-join primitives driven by an
++external controller instead of a fixed schedule.
++
++Active only when ``VERL_TPU_POOL_CONTROL`` holds a JSON config; otherwise ``update_weights`` is the late-join spike
++(``VERL_TPU_LATE_JOIN_SPIKE``) or plain ``update_raiden_weights``. Config keys::
++
++    {"min": 1, "max": 8, "initial_active": 1, "log": "/data/tpu-m2/pool.jsonl", "port": 8787,
++     "lb_poll_s": 2.0, "health_poll_s": 3.0, "health_timeout_s": 20.0, "probe": true,
++     "spawn": false, "spawn_cache_dirs": {"1": "/tmp/torchinductor_cold_x"}}
++
++Runs in the trainer process (the manager hook is called from ``on_step_end`` through
++``CheckpointEngineManager.update_weights``). Membership changes happen ONLY in ``around()`` outside the Raiden
++transfer, so no change races a sync; ONE policy move per sync (join or leave); a joiner is added to the load
++balancer only after the sync that installed the current version; a replica found dead by the watchdog is cut from
++the load balancer at once and from the membership at the next sync (a repair, not a policy move).
++
++leave  = LB remove_servers -> abort_all_requests(reject) -> TPUWorker.sleep(level 2) -> manager.remove_replicas
++join   = TPUWorker.wake_up(weights, kv_cache) -> manager.add_replicas -> [sync installs the version] ->
++         LB add_servers + clear_sticky_cache -> probe (first token, greedy 16 vs the other replicas)
++spawn  = (``spawn: true``) a NEW replica process set through ``RolloutReplica.init_standalone`` in a background
++         thread, then the join path at the next sync (the fresh-pod product path, measured here as
++         request -> process ready -> version installed -> first token).
++"""
++
++import asyncio
++import gc
++import json
++import logging
++import os
++import threading
++import time
++from datetime import datetime, timezone
++from typing import Any, Optional
++
++import ray
++
++from verl_hardware_plugin.accelerators.tpu.engines.raiden_checkpoint_engine import update_raiden_weights
++
++logger = logging.getLogger(__name__)
++logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
++
++CONTROL_ENV = "VERL_TPU_POOL_CONTROL"
++SPIKE_ENV = "VERL_TPU_LATE_JOIN_SPIKE"
++ACTOR_NAME = "tpu_pool_control"
++PROBE_PROMPT = [785, 6722, 315, 9625, 374]
++PROBE_TOKENS = 16
++TRAINER_KEYS = (
++    "timing_s/step",
++    "timing_s/gen",
++    "timing_s/old_log_prob",
++    "timing_s/ref",
++    "timing_s/adv",
++    "timing_s/update_actor",
++    "timing_s/update_weights",
++    "critic/score/mean",
++    "response_length/mean",
++    "perf/throughput",
++    "perf/total_num_tokens",
++)
++
++
++def _utc() -> str:
++    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
++
++
++def _find_trainer(manager: Any) -> Any:
++    """The trainer instance holding ``manager`` as ``standalone_checkpoint_manager`` (no back-reference exists)."""
++    for d in gc.get_referrers(manager):
++        if isinstance(d, dict) and d.get("standalone_checkpoint_manager") is manager:
++            for obj in gc.get_referrers(d):
++                if getattr(obj, "__dict__", None) is d and hasattr(obj, "standalone_server_manager"):
++                    return obj
++    raise RuntimeError("pool control: no trainer holds this manager as standalone_checkpoint_manager")
++
++
++def _head_node_ip() -> Optional[str]:
++    for node in ray.nodes():
++        if node.get("Alive") and "node:__internal_head__" in node.get("Resources", {}):
++            return node.get("NodeManagerAddress")
++    return None
++
++
++class PoolHook:
++    def __init__(self, manager: Any, cfg: dict):
++        self.manager = manager
++        self.cfg = cfg
++        self.min = int(cfg.get("min", 1))
++        self.max = int(cfg.get("max", 8))
++        self.log_path = cfg.get("log", "/data/tpu-m2/pool.jsonl")
++        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
++        self.trainer = _find_trainer(manager)
++        self.server_manager = self.trainer.standalone_server_manager
++        self.lb = self.server_manager.global_load_balancer
++        self.all: dict[int, Any] = {r.replica_rank: r for r in manager.replicas}
++        self.active: list[int] = sorted(self.all)
++        self.parked: list[int] = []
++        self.dead: dict[int, dict] = {}
++        self.dead_in_manager: set[int] = set()
++        self.versions: dict[int, int] = {}
++        self.spawn_ready: list[int] = []
++        self.destroyed: list[int] = []
++        self.spawns: dict[int, dict] = {}
++        self.spawning = False
++        self.next_rank = (max(self.all) + 1) if self.all else 0
++        self.n_sync = 0
++        self.last_sync_wall: Optional[float] = None
++        self.last_sync_version: Optional[int] = None
++        self.idle_ema: Optional[float] = None
++        self.initial_active = int(cfg.get("initial_active", len(self.active)))
++        self.initial_done = False
++        self._lock = threading.Lock()
++        self._stop = threading.Event()
++        self._inflight: dict[str, int] = {}
++        self._logger_wrapped = False
++        # Slot utilization (TPU-M3): per-replica slot cap = vLLM max_num_seqs (the admission cap the V1 path lacks); the LB
++        # sampler records (mono, lb_total_inflight, n_active) and the step tap folds them into time-weighted means per step.
++        try:
++            rc = self.trainer.config.actor_rollout_ref.rollout
++            self.slot_cap = int(rc.max_num_seqs)
++            self.rollout_n = int(rc.n)
++        except Exception:  # noqa: BLE001
++            self.slot_cap, self.rollout_n = 0, 1
++        self._occ: list[tuple[float, int, int]] = []
++        self._occ_lock = threading.Lock()
++        self._occ_last_cut = time.perf_counter()
++        self.util: dict[str, Any] = {}
++        self.traj: dict[str, Any] = {}
++        try:
++            self.train_batch_size = int(self.trainer.config.data.train_batch_size)
++        except Exception:  # noqa: BLE001
++            self.train_batch_size = 0
++        self.ctrl = self._create_actor()
++        self.log("init", replicas=sorted(self.all), addresses=self.addresses(), cfg=cfg, actor=str(self.ctrl),
++                 actor_host=self.actor_host, port=int(cfg.get("port", 8787)))
++        threading.Thread(target=self._lb_sampler, name="pool-lb-sampler", daemon=True).start()
++        threading.Thread(target=self._watchdog, name="pool-watchdog", daemon=True).start()
++
++    # ------------------------------------------------------------------ plumbing
++    def _create_actor(self) -> Any:
++        from verl_hardware_plugin.accelerators.tpu.engines.tpu_pool_actor import PoolControlState
++
++        opts: dict[str, Any] = {"name": ACTOR_NAME, "get_if_exists": True, "num_cpus": 0, "max_concurrency": 32}
++        head_ip = self.cfg.get("actor_host") or _head_node_ip()
++        if head_ip:
++            # Hard pin to the head through its node:<ip> resource (a soft NodeAffinity landed the actor on the
++            # TaskRunner's node in the first run); the HTTP endpoint is then at <head pod ip>:port.
++            opts["resources"] = {f"node:{head_ip}": 0.001}
++        self.actor_host = head_ip
++        actor_cfg = {
++            "min": self.min,
++            "max": self.max,
++            "initial_active": self.initial_active,
++            "port": int(self.cfg.get("port", 8787)),
++            "train_batch_size": self.train_batch_size,
++        }
++        actor = ray.remote(PoolControlState).options(**opts).remote(actor_cfg)
++        ray.get(actor.ping.remote(), timeout=120)
++        return actor
++
++    def addresses(self) -> dict[str, str]:
++        return {str(k): str(r.server_address) for k, r in self.all.items()}
++
++    def log(self, kind: str, **kw: Any) -> None:
++        rec = {"t": _utc(), "mono": time.perf_counter(), "kind": kind, "sync": self.n_sync, **kw}
++        line = json.dumps(rec, default=str)
++        try:
++            with open(self.log_path, "a") as f:
++                f.write(line + "\n")
++        except OSError:
++            pass
++        logger.info(f"[POOL] {line}")
++        try:
++            self.ctrl.push_event.remote(rec)
++        except Exception:  # noqa: BLE001
++            pass
++
++    def _report(self, **extra: Any) -> None:
++        rep = {
++            "t": _utc(),
++            "active": list(self.active),
++            "parked": list(self.parked),
++            "dead": sorted(self.dead),
++            "pending_repair": bool(set(self.dead) - self.dead_in_manager),
++            "spawning": self.spawning,
++            "spawn_ready": list(self.spawn_ready),
++            "destroyed": list(self.destroyed),
++            "versions": {str(k): v for k, v in self.versions.items()},
++            "addresses": self.addresses(),
++            "inflight": dict(self._inflight),
++            "n_sync": self.n_sync,
++            "last_sync_wall_s": self.last_sync_wall,
++            "last_sync_version": self.last_sync_version,
++            "train_batch_size": self.train_batch_size,
++            "idle_ema": self.idle_ema,
++            "slot_cap": self.slot_cap,
++            "rollout_n": self.rollout_n,
++            "util": dict(self.util),
++            "traj": dict(self.traj),
++            **extra,
++        }
++        try:
++            self.ctrl.set_report.remote(rep)
++        except Exception as e:  # noqa: BLE001
++            logger.warning(f"[POOL] report failed: {e}")
++
++    def _lb_sampler(self) -> None:
++        poll = float(self.cfg.get("lb_poll_s", 2.0))
++        while not self._stop.is_set():
++            try:
++                st = ray.get(self.lb.get_status.remote(), timeout=10)
++                addr_to_rank = {v: k for k, v in self.addresses().items()}
++                servers = {str(addr_to_rank.get(a, a)): n for a, n in st.get("servers", {}).items()}
++                self._inflight = servers
++                lb_total = sum(int(v) for v in servers.values())
++                with self._occ_lock:
++                    self._occ.append((time.perf_counter(), lb_total, len(self.active)))
++                    if len(self._occ) > 20000:
++                        self._occ = self._occ[-10000:]
++                rec = {"t": _utc(), "mono": time.perf_counter(), "kind": "lb", "inflight": servers, "lb_total": lb_total,
++                       "n_active": len(self.active), "cap": self.slot_cap}
++                with open(self.log_path, "a") as f:
++                    f.write(json.dumps(rec) + "\n")
++            except Exception as e:  # noqa: BLE001
++                logger.warning(f"[POOL] lb sampler: {e}")
++            time.sleep(poll)
++
++    def _watchdog(self) -> None:
++        """Marks an ACTIVE replica dead when a no-op worker RPC fails or times out; cuts it from the LB at once."""
++        poll = float(self.cfg.get("health_poll_s", 3.0))
++        timeout = float(self.cfg.get("health_timeout_s", 20.0))
++        needed = int(self.cfg.get("health_failures", 2))
++        failures: dict[int, int] = {}
++        first_fail: dict[int, tuple[str, float]] = {}
++        while not self._stop.is_set():
++            for rank in list(self.active):
++                if rank in self.dead:
++                    continue
++                r = self.all.get(rank)
++                if r is None:
++                    continue
++                t0 = time.perf_counter()
++                try:
++                    # WorkerBase.check_health is a no-op function on every vLLM worker (TPUWorker.is_sleeping is a property
++                    # in this image, not callable through run_method). The RPC crosses server actor -> EngineCore -> workers.
++                    ray.get(r.server_handle.collective_rpc.remote(method="check_health"), timeout=timeout)
++                    failures.pop(rank, None)
++                    first_fail.pop(rank, None)
++                except Exception as e:  # noqa: BLE001
++                    failures[rank] = failures.get(rank, 0) + 1
++                    first_fail.setdefault(rank, (_utc(), t0))
++                    self.log("health_probe_failed", rank=rank, n=failures[rank], error=repr(e)[:300])
++                    if failures[rank] < needed:
++                        continue
++                    t_detect = time.perf_counter()
++                    info = {"t_detect": _utc(), "mono_detect": t_detect, "probe_s": t_detect - t0, "error": repr(e)[:400],
++                            "t_first_fail": first_fail[rank][0], "first_fail_to_detect_s": t_detect - first_fail[rank][1]}
++                    try:
++                        ray.get(self.lb.remove_servers.remote([r.server_address]), timeout=30)
++                        info["lb_removed_s"] = time.perf_counter() - t_detect
++                    except Exception as e2:  # noqa: BLE001
++                        info["lb_remove_error"] = repr(e2)[:200]
++                    with self._lock:
++                        self.dead[rank] = info
++                    self.log("dead_detected", rank=rank, **info, active=list(self.active))
++                    self._report()
++            time.sleep(poll)
++
++    def _sampleable(self) -> Optional[int]:
++        rb = getattr(self.trainer, "replay_buffer", None)
++        fn = getattr(rb, "get_sampleable_count", None)
++        if fn is None:
++            return None
++        try:
++            return int(fn(int(self.trainer.global_steps) + 1, "train"))
++        except Exception as e:  # noqa: BLE001
++            logger.debug(f"[POOL] sampleable: {e}")
++            return None
++
++    def _wrap_logger_once(self) -> None:
++        if self._logger_wrapped:
++            return
++        lg = getattr(self.trainer, "logger", None)
++        if lg is None:
++            return
++        orig = lg.log
++        hook = self
++
++        def log(*args, **kwargs):
++            data = kwargs.get("data", args[0] if args else None)
++            step = kwargs.get("step", args[1] if len(args) > 1 else None)
++            try:
++                hook.on_trainer_log(data, step)
++            except Exception as e:  # noqa: BLE001
++                logger.warning(f"[POOL] trainer log tap: {e}")
++            return orig(*args, **kwargs)
++
++        lg.log = log
++        self._logger_wrapped = True
++
++    def on_trainer_log(self, data: Any, step: Any) -> None:
++        if not isinstance(data, dict) or step is None:
++            return
++        picked = {k: data[k] for k in TRAINER_KEYS if k in data}
++        picked.update({k: v for k, v in data.items() if k.startswith("timing_s/tpu-sync/")})
++        if not picked:
++            return
++        step_s, gen_s = picked.get("timing_s/step"), picked.get("timing_s/gen")
++        if step_s and gen_s is not None and float(step_s) > 0:
++            idle = float(gen_s) / float(step_s)
++            self.idle_ema = idle if self.idle_ema is None else 0.5 * self.idle_ema + 0.5 * idle
++        self.util = self._fold_occupancy()
++        self.traj = self._traj_inflight()
++        self.ctrl.set_trainer_metrics.remote(int(step), picked)
++        self.log("step", step=int(step), active=list(self.active), n_active=len(self.active), metrics=picked,
++                 util=self.util, traj=self.traj)
++        self._report()
++
++    def _fold_occupancy(self) -> dict:
++        """Time-weighted means of the LB occupancy samples since the previous step log (= one step window).
++
++        decode_slot_util = mean over time of min(1, lb_total_inflight / (n_active * slot_cap)): the share of the active replicas'
++        vLLM slots (max_num_seqs) occupied by generate requests (requests queued inside vLLM count, so this saturates at 1 while a
++        batch is backed up and falls in the tail). Also the raw mean in-flight and the mean active count over the window.
++        """
++        now = time.perf_counter()
++        with self._occ_lock:
++            cut = self._occ_last_cut
++            samples = [x for x in self._occ if x[0] >= cut]
++            self._occ_last_cut = now
++            self._occ = [x for x in self._occ if x[0] >= cut]
++        if len(samples) < 2 or not self.slot_cap:
++            return {"window_s": now - cut, "samples": len(samples)}
++        num_u = num_in = num_act = 0.0
++        den = 0.0
++        full = 0.0
++        for (t0, lb, na), (t1, _lb1, _na1) in zip(samples, samples[1:], strict=False):
++            dt = max(0.0, t1 - t0)
++            cap = max(1, na) * self.slot_cap
++            u = min(1.0, lb / cap)
++            num_u += u * dt
++            num_in += lb * dt
++            num_act += na * dt
++            full += dt if lb >= cap else 0.0
++            den += dt
++        if den <= 0:
++            return {"window_s": now - cut, "samples": len(samples)}
++        return {"window_s": now - cut, "samples": len(samples), "decode_slot_util": num_u / den,
++                "lb_inflight_mean": num_in / den, "n_active_mean": num_act / den, "share_slots_full": full / den,
++                "cap_per_replica": self.slot_cap}
++
++    def _traj_inflight(self) -> dict:
++        """Trajectories in flight right now (agent loops started and not finished, incl. time in the sandbox), from the
++        TransferQueue metadata: running prompt groups x rollout.n minus their finished trajectories. Called from the trainer
++        thread only (the TQ client is used by the replay buffer on that thread)."""
++        try:
++            import transfer_queue as tq
++
++            data = tq.kv_list()
++        except Exception as e:  # noqa: BLE001
++            return {"error": repr(e)[:120]}
++        part = (data or {}).get("train") or {}
++        running = {k for k, tag in part.items() if tag.get("is_prompt") and tag.get("status") == "running"}
++        pending = sum(1 for tag in part.values() if tag.get("is_prompt") and tag.get("status") == "pending")
++        done: dict[str, int] = {}
++        for k, tag in part.items():
++            if tag.get("is_prompt"):
++                continue
++            uid = k.rsplit("_", 2)[0]
++            if uid in running:
++                done[uid] = done.get(uid, 0) + 1
++        inflight = sum(max(0, self.rollout_n - done.get(u, 0)) for u in running)
++        cap = max(1, len(self.active)) * max(1, self.slot_cap)
++        return {"running_groups": len(running), "pending_groups": pending, "traj_inflight": inflight,
++                "traj_slot_ratio": inflight / cap}
++
++    # ------------------------------------------------------------------ primitives (TPU-M1)
++    async def leave(self, rank: int, why: str) -> None:
++        r = self.all[rank]
++        t0 = time.perf_counter()
++        await self.lb.remove_servers.remote([r.server_address])
++        t1 = time.perf_counter()
++        aborted = await r.server_handle.abort_all_requests.remote(reject_request=True)
++        t2 = time.perf_counter()
++        slept = await r.server_handle.collective_rpc.remote(method="sleep", kwargs={"level": 2})
++        t3 = time.perf_counter()
++        self.manager.remove_replicas([r])
++        if rank in self.active:
++            self.active.remove(rank)
++        if rank not in self.parked:
++            self.parked.append(rank)
++        self.log(
++            "leave", rank=rank, why=why, lb_remove_s=t1 - t0, abort_s=t2 - t1, sleep_s=t3 - t2, total_s=t3 - t0,
++            aborted=aborted, sleep_info=slept, manager_replicas=[x.replica_rank for x in self.manager.replicas],
++            active=list(self.active), parked=list(self.parked),
++        )
++
++    async def destroy(self, rank: int, why: str) -> dict:
++        """Product-path removal (TPU-M3): LB cut -> abort (unless already dead) -> out of the Raiden membership -> kill
++        the replica's server and worker actors -> remove its placement groups, so the host's chips are free for a
++        replacement spawn or for the Kubernetes actuator to delete the pod. Nothing is parked."""
++        r = self.all.get(rank)
++        rec: dict[str, Any] = {"rank": rank, "why": why}
++        if r is None:
++            self.log("destroy", **rec, error="unknown rank")
++            return rec
++        t0 = time.perf_counter()
++        try:
++            await self.lb.remove_servers.remote([r.server_address])
++        except Exception as e:  # noqa: BLE001
++            rec["lb_remove_error"] = repr(e)[:200]
++        t1 = time.perf_counter()
++        if rank not in self.dead:
++            try:
++                rec["aborted"] = await asyncio.wait_for(r.server_handle.abort_all_requests.remote(reject_request=True), timeout=30)
++            except Exception as e:  # noqa: BLE001
++                rec["abort_error"] = repr(e)[:200]
++        t2 = time.perf_counter()
++        try:
++            if any(x is r for x in self.manager.replicas):
++                self.manager.remove_replicas([r])
++        except Exception as e:  # noqa: BLE001
++            rec["manager_remove_error"] = repr(e)[:200]
++        killed = 0
++        for h in list(getattr(r, "servers", None) or []) + list(getattr(r, "workers", None) or []):
++            try:
++                ray.kill(h, no_restart=True)
++                killed += 1
++            except Exception:  # noqa: BLE001
++                pass
++        removed = 0
++        for pg in list(getattr(getattr(r, "resource_pool", None), "pgs", None) or []):
++            try:
++                ray.util.remove_placement_group(pg)
++                removed += 1
++            except Exception:  # noqa: BLE001
++                pass
++        sm = self.server_manager
++        for attr, item in (("rollout_replicas", r), ("server_handles", getattr(r, "server_handle", None)),
++                           ("server_addresses", getattr(r, "server_address", None))):
++            try:
++                getattr(sm, attr).remove(item)
++            except (ValueError, AttributeError):
++                pass
++        with self._lock:
++            for coll in (self.active, self.parked, self.spawn_ready):
++                if rank in coll:
++                    coll.remove(rank)
++            self.all.pop(rank, None)
++            self.dead_in_manager.add(rank)
++            self.destroyed.append(rank)
++        t3 = time.perf_counter()
++        rec.update(lb_remove_s=t1 - t0, abort_s=t2 - t1, kill_s=t3 - t2, total_s=t3 - t0, killed_actors=killed,
++                   pgs_removed=removed, active=list(self.active),
++                   manager_replicas=[x.replica_rank for x in self.manager.replicas])
++        self.log("destroy", **rec)
++        self._report()
++        return rec
++
++    async def join_before_sync(self, rank: int, why: str) -> dict:
++        r = self.all[rank]
++        rec: dict[str, Any] = {"rank": rank, "why": why}
++        t0 = time.perf_counter()
++        if rank in self.parked:
++            try:
++                rec["wake"] = await r.server_handle.collective_rpc.remote(
++                    method="wake_up", kwargs={"tags": ["weights", "kv_cache"]}
++                )
++            except Exception as e:  # noqa: BLE001
++                rec["wake_error"] = repr(e)[:300]
++            rec["wake_s"] = time.perf_counter() - t0
++            self.parked.remove(rank)
++        if rank in self.spawn_ready:
++            self.spawn_ready.remove(rank)
++        self.manager.add_replicas([r])
++        self.active.append(rank)
++        rec["manager_replicas"] = [x.replica_rank for x in self.manager.replicas]
++        self.log("join_before_sync", **rec, active=list(self.active), parked=list(self.parked))
++        return rec
++
++    async def _probe(self, r: Any, request_id: str, max_tokens: int) -> tuple[float, list[int]]:
++        t0 = time.perf_counter()
++        out = await r.server_handle.generate.remote(
++            prompt_ids=list(PROBE_PROMPT),
++            sampling_params={"temperature": 0.0, "max_tokens": max_tokens, "logprobs": True},
++            request_id=request_id,
++        )
++        return time.perf_counter() - t0, list(getattr(out, "token_ids", []) or [])
++
++    async def join_after_sync(self, rank: int, global_steps: Optional[int]) -> dict:
++        r = self.all[rank]
++        t0 = time.perf_counter()
++        await self.lb.add_servers.remote({r.server_address: r.server_handle})
++        cleared = await self.lb.clear_sticky_cache.remote()
++        t1 = time.perf_counter()
++        rec: dict[str, Any] = {"rank": rank, "lb_add_s": t1 - t0, "cleared": cleared, "version": global_steps}
++        self.versions[rank] = int(global_steps or 0)
++        if self.cfg.get("probe", True):
++            try:
++                ft_s, ft_ids = await self._probe(r, f"pool-ft-{rank}-{self.n_sync}", 1)
++                rec.update(first_token_s=ft_s, first_token_ids=ft_ids)
++                greedy = {}
++                for x in self.manager.replicas:
++                    if x.replica_rank in self.dead:
++                        continue
++                    s, ids = await self._probe(x, f"pool-greedy-{x.replica_rank}-{self.n_sync}", PROBE_TOKENS)
++                    greedy[x.replica_rank] = {"s": s, "ids": ids}
++                others = [v["ids"] for k, v in greedy.items() if k != rank]
++                rec.update(greedy=greedy, greedy_equal_to_others=[v == greedy[rank]["ids"] for v in others])
++            except Exception as e:  # noqa: BLE001
++                rec["probe_error"] = repr(e)[:300]
++        self.log("join_after_sync", **rec, active=list(self.active))
++        return rec
++
++    # ------------------------------------------------------------------ cold spawn (init_standalone)
++    def start_spawn(self, t_request: Optional[float]) -> None:
++        rank = self.next_rank
++        self.next_rank += 1
++        self.spawning = True
++        rec: dict[str, Any] = {
++            "rank": rank,
++            "t_request": t_request,
++            "t_start": _utc(),
++            "mono_start": time.perf_counter(),
++            "req_to_start_s": (time.perf_counter() - t_request) if t_request else None,
++        }
++        self.spawns[rank] = rec
++        cache_dir = (self.cfg.get("spawn_cache_dirs") or {}).get(str(rank))
++        if cache_dir:
++            os.environ[f"VERL_TPU_POOL_WORKER_ENV_{rank}"] = json.dumps({"TORCHINDUCTOR_CACHE_DIR": cache_dir})
++            rec["cache_dir"] = cache_dir
++        self.log("spawn_start", **{k: v for k, v in rec.items() if k != "mono_start"})
++
++        def run() -> None:
++            try:
++                sm = self.server_manager
++                replica = sm.rollout_replica_class(
++                    replica_rank=rank,
++                    config=sm.rollout_config,
++                    model_config=sm.model_config,
++                    gpus_per_node=sm.rollout_config.n_gpus_per_node,
++                )
++                asyncio.run(replica.init_standalone())
++                rec["mono_ready"] = time.perf_counter()
++                rec["t_ready"] = _utc()
++                rec["init_standalone_s"] = rec["mono_ready"] - rec["mono_start"]
++                rec["address"] = replica.server_address
++                with self._lock:
++                    self.all[rank] = replica
++                    self.spawn_ready.append(rank)
++                try:
++                    sm.rollout_replicas.append(replica)
++                    sm.server_handles.append(replica.server_handle)
++                    sm.server_addresses.append(replica.server_address)
++                except Exception:  # noqa: BLE001
++                    pass
++                self.log("spawn_ready", **{k: v for k, v in rec.items() if not k.startswith("mono")})
++            except Exception as e:  # noqa: BLE001
++                rec["error"] = repr(e)[:800]
++                self.log("spawn_error", rank=rank, error=rec["error"])
++            finally:
++                self.spawning = False
++                self._report()
++
++        threading.Thread(target=run, name=f"pool-spawn-{rank}", daemon=True).start()
++
++    # ------------------------------------------------------------------ the sync wrapper
++    async def around(self, global_steps: Optional[int]) -> dict:
++        idx = self.n_sync
++        self._wrap_logger_once()
++        joiners: list[int] = []
++        desired = None
++        if not self.initial_done:
++            # Sync 0 (on_init_end): park the replicas beyond initial_active BEFORE their first Raiden registration
++            # (TPU-M1 J1c path: a parked replica registers inside the sync that first includes it).
++            for rank in list(self.active[self.initial_active :]):
++                await self.leave(rank, "initial park")
++            self.initial_done = True
++        else:
++            # Pre-sync health sweep: a replica that died since the watchdog's last pass must not be addressed by this
++            # sync (the first failure act showed the sync reaching a dead unit 12 s after the kill, before a 20 s-timeout
++            # probe could fail twice, and the job died in the transfer). One short no-op RPC per active replica.
++            await self._presync_health()
++            # Repairs first: a dead replica is already out of the LB; take it out of the membership before the sync.
++            for rank in sorted(set(self.dead) - self.dead_in_manager):
++                r = self.all[rank]
++                self.manager.remove_replicas([r])
++                self.dead_in_manager.add(rank)
++                if rank in self.active:
++                    self.active.remove(rank)
++                self.log("dead_removed", rank=rank, active=list(self.active),
++                         manager_replicas=[x.replica_rank for x in self.manager.replicas])
++                if self.cfg.get("destroy_dead", True):
++                    await self.destroy(rank, "dead")
++            try:
++                desired = int(ray.get(self.ctrl.get_desired.remote(), timeout=30))
++            except Exception as e:  # noqa: BLE001
++                self.log("desired_error", error=repr(e)[:200])
++            if desired is not None:
++                n_active = len(self.active)
++                if desired > n_active:
++                    cand = self.spawn_ready[0] if self.spawn_ready else (self.parked[0] if self.parked else None)
++                    if cand is not None:
++                        await self.join_before_sync(cand, f"scale_out desired={desired} active={n_active}")
++                        joiners.append(cand)
++                    elif self.cfg.get("spawn", False) and not self.spawning:
++                        if self.next_rank < int(self.cfg.get("max_rank", 8)):
++                            self.start_spawn(t_request=self._desired_since(desired))
++                        else:
++                            self.log("spawn_refused", reason="max_rank reached", next_rank=self.next_rank)
++                    else:
++                        self.log("hold", reason="no parked/ready replica", desired=desired, active=n_active,
++                                 spawning=self.spawning)
++                elif desired < n_active and n_active > self.min:
++                    victim = self.active[-1]
++                    try:
++                        release = bool(ray.get(self.ctrl.get_release.remote(), timeout=30))
++                    except Exception:  # noqa: BLE001
++                        release = False
++                    if release:
++                        await self.destroy(victim, f"scale_in release desired={desired} active={n_active}")
++                    else:
++                        await self.leave(victim, f"scale_in desired={desired} active={n_active}")
++        units = [x.replica_rank for x in self.manager.replicas]
++        sampleable = self._sampleable()
++        self.log("sync_begin", global_steps=global_steps, manager_replicas=units, desired=desired,
++                 joiners=joiners, sampleable=sampleable, active=list(self.active), parked=list(self.parked))
++        t0 = time.perf_counter()
++        metrics = await update_raiden_weights(self.manager, global_steps=global_steps)
++        sync_s = time.perf_counter() - t0
++        self.last_sync_wall = sync_s
++        self.last_sync_version = int(global_steps or 0)
++        for rank in self.active:
++            self.versions[rank] = int(global_steps or 0)
++        keep = {k.split("/")[-1]: v for k, v in (metrics or {}).items() if k.startswith("timing_s/tpu-sync/")}
++        self.log("sync_end", global_steps=global_steps, manager_replicas=units, sync_s=sync_s, phases=keep)
++        for rank in joiners:
++            rec = await self.join_after_sync(rank, global_steps)
++            sp = self.spawns.get(rank)
++            if sp is not None and "mono_ready" in sp:
++                now = time.perf_counter()
++                sp["joined_sync"] = idx
++                sp["ready_to_lb_add_s"] = now - sp["mono_ready"]
++                sp["req_to_first_token_s"] = (now - sp["t_request"]) if sp.get("t_request") else None
++                sp["first_token_s"] = rec.get("first_token_s")
++                self.log("spawn_joined", **{k: v for k, v in sp.items() if not k.startswith("mono")})
++        self.n_sync += 1
++        self._report(sampleable=sampleable, last_sync_phases=keep)
++        return metrics
++
++    async def _presync_health(self) -> None:
++        timeout = float(self.cfg.get("presync_timeout_s", 5.0))
++        for rank in list(self.active):
++            if rank in self.dead:
++                continue
++            r = self.all.get(rank)
++            if r is None:
++                continue
++            t0 = time.perf_counter()
++            try:
++                await asyncio.wait_for(r.server_handle.collective_rpc.remote(method="check_health"), timeout=timeout)
++            except Exception as e:  # noqa: BLE001
++                t_detect = time.perf_counter()
++                info = {"t_detect": _utc(), "mono_detect": t_detect, "probe_s": t_detect - t0, "error": repr(e)[:400],
++                        "source": "presync"}
++                try:
++                    await self.lb.remove_servers.remote([r.server_address])
++                    info["lb_removed_s"] = time.perf_counter() - t_detect
++                except Exception as e2:  # noqa: BLE001
++                    info["lb_remove_error"] = repr(e2)[:200]
++                with self._lock:
++                    self.dead[rank] = info
++                self.log("dead_detected", rank=rank, **info, active=list(self.active))
++
++    def _desired_since(self, desired: int) -> Optional[float]:
++        """perf_counter of the moment the controller first asked for ``desired`` (for the request->first-token clock)."""
++        try:
++            st = ray.get(self.ctrl.status.remote(), timeout=10)
++            reqs = [q for q in st.get("scale_requests", []) if int(q.get("desired", -1)) == desired]
++            if reqs:
++                wall = float(reqs[-1]["t"])
++                return time.perf_counter() - (time.time() - wall)
++        except Exception:  # noqa: BLE001
++            return None
++        return None
++
++
++async def update_weights(manager: Any, global_steps: Optional[int] = None) -> dict[str, float]:
++    """``update_raiden_weights`` behind the pool hook (``VERL_TPU_POOL_CONTROL``) or the spike (``VERL_TPU_LATE_JOIN_SPIKE``)."""
++    raw = os.environ.get(CONTROL_ENV, "").strip()
++    if raw:
++        hook = getattr(manager, "_pool_hook", None)
++        if hook is None:
++            hook = PoolHook(manager, json.loads(raw))
++            manager._pool_hook = hook
++        return await hook.around(global_steps)
++    if os.environ.get(SPIKE_ENV, "").strip():
++        from verl_hardware_plugin.accelerators.tpu.engines.late_join_spike import update_weights as spike_update
++
++        return await spike_update(manager, global_steps=global_steps)
++    return await update_raiden_weights(manager, global_steps=global_steps)
++
++
++# ---------------------------------------------------------------------- client-side retry on a dead server
++_DEAD_MARKERS = ("EngineDead", "ActorDied", "RayActorError", "ActorUnavailable", "Engine core", "EngineCore", "died")
++
++
++def _looks_dead(e: BaseException) -> bool:
++    try:
++        if isinstance(e, ray.exceptions.RayActorError | ray.exceptions.ActorUnavailableError):
++            return True
++    except AttributeError:
++        if isinstance(e, ray.exceptions.RayActorError):
++            return True
++    text = f"{type(e).__name__}: {e!r}"
++    return any(m in text for m in _DEAD_MARKERS)
++
++
++def patch_client_retry_on_dead_server(max_attempts: int = 60, sleep_s: float = 1.0) -> bool:
++    """``LLMServerClient.generate`` retries (re-acquiring a server) when the server it hit is dead.
++
++    Stock verl propagates the error into the agent loop (``asyncio.gather`` without return_exceptions). With this
++    patch the request is re-routed once the watchdog has removed the dead server from the load balancer (the sticky
++    entry is dropped on removal). Applied in every verl process when ``VERL_TPU_POOL_RETRY_DEAD=1``.
++    """
++    try:
++        from verl.workers.rollout import llm_server
++    except Exception as e:  # noqa: BLE001
++        logger.debug(f"[POOL] client retry patch skipped: {e}")
++        return False
++    cls = llm_server.LLMServerClient
++    if getattr(cls, "_pool_retry_patched", False):
++        return True
++    orig = cls.generate
++
++    async def generate(self, request_id, **kwargs):
++        attempt = 0
++        while True:
++            try:
++                return await orig(self, request_id, **kwargs)
++            except asyncio.CancelledError:
++                raise
++            except Exception as e:  # noqa: BLE001
++                attempt += 1
++                if attempt >= max_attempts or not _looks_dead(e):
++                    raise
++                logger.warning(f"[POOL] request {request_id}: server error ({type(e).__name__}), retry {attempt} in {sleep_s}s")
++                await asyncio.sleep(sleep_s)
++
++    cls.generate = generate
++    cls._pool_retry_patched = True
++    return True
+diff --git a/verl_hardware_plugin/accelerators/tpu/registration.py b/verl_hardware_plugin/accelerators/tpu/registration.py
+index 4d09a81..1b9fe59 100644
+--- a/verl_hardware_plugin/accelerators/tpu/registration.py
++++ b/verl_hardware_plugin/accelerators/tpu/registration.py
+@@ -48,3 +48,13 @@ try:
+     register_rollout()
+ except Exception as exc:
+     logger.debug("TPU rollout registration failed: %s", exc)
++
++
++if os.environ.get("VERL_TPU_POOL_RETRY_DEAD") == "1":
++    # Pool-control experiment: rollout requests that hit a dead server are re-routed instead of failing the agent loop.
++    try:
++        from verl_hardware_plugin.accelerators.tpu.engines.tpu_pool_control import patch_client_retry_on_dead_server
++
++        patch_client_retry_on_dead_server()
++    except Exception as exc:
++        logger.debug("TPU pool client retry patch failed: %s", exc)
+diff --git a/verl_hardware_plugin/accelerators/tpu/rollout/tpu_vllm.py b/verl_hardware_plugin/accelerators/tpu/rollout/tpu_vllm.py
+index d25b4c5..e0bb662 100644
+--- a/verl_hardware_plugin/accelerators/tpu/rollout/tpu_vllm.py
++++ b/verl_hardware_plugin/accelerators/tpu/rollout/tpu_vllm.py
+@@ -25,6 +25,7 @@ The same logic previously lived behind ``get_resource_name() == "TPU"`` branches
+ """
+ 
+ import asyncio
++import json
+ import logging
+ import os
+ from typing import Any, Callable, Optional
+@@ -194,6 +195,12 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
+         chip_offset = os.environ.get("VERL_TPU_ROLLOUT_CHIP_OFFSET")
+         if chip_offset:
+             env_vars["VERL_TPU_ROLLOUT_CHIP_BASE"] = str(int(chip_offset) + replica.replica_rank * replica.world_size)
++        # Per-replica worker environment (pool-control experiment: e.g. a fresh TORCHINDUCTOR_CACHE_DIR for a cold
++        # spawn). The server/EngineCore get it here; _init_workers_ray forwards it to the replica's vLLM workers.
++        pool_env = os.environ.get(f"VERL_TPU_POOL_WORKER_ENV_{replica.replica_rank}")
++        if pool_env:
++            env_vars["VERL_TPU_POOL_WORKER_ENV"] = pool_env
++            env_vars.update(json.loads(pool_env))
+ 
+     server = replica.server_class.options(
+         scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+diff --git a/verl_hardware_plugin/accelerators/tpu/rollout/tpu_vllm_patches.py b/verl_hardware_plugin/accelerators/tpu/rollout/tpu_vllm_patches.py
+index d93fe76..e69bef8 100644
+--- a/verl_hardware_plugin/accelerators/tpu/rollout/tpu_vllm_patches.py
++++ b/verl_hardware_plugin/accelerators/tpu/rollout/tpu_vllm_patches.py
+@@ -33,6 +33,7 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
+ 
+ import importlib.util
+ import inspect
++import json
+ import logging
+ import multiprocessing.process
+ import os
+@@ -328,8 +329,10 @@ def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
+     }
+     # torch_tpu's own rendezvous, separate from the torch.distributed one below.
+     torch_tpu_master = {"MASTER_ADDR": ips[0], "MASTER_PORT": str(get_open_port())}
++    # Per-replica worker environment handed down by launch_tpu_vllm_servers (pool-control experiment).
++    pool_env = json.loads(os.environ.get("VERL_TPU_POOL_WORKER_ENV") or "{}")
+     self._env_vars_for_all_workers = [
+-        {**driver_env, **torch_tpu_master, **tpu_env}
++        {**driver_env, **torch_tpu_master, **tpu_env, **pool_env}
+         for tpu_env in _tpu_worker_envs(ips, vllm_torchtpu_envs.TORCH_TPU_BASE_PORT, chips=chips)
+     ]
+     self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.log
+*.err
+*.csv
+*.jsonl
+*.png
+*.svg
+*.html
+*.tgz
+.DS_Store

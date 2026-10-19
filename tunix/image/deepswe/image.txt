@@ -1,0 +1,1 @@
+us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-deepswe-raiden-20261015035906

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl60-orch-metrics
+  namespace: default
+  labels: {app: tunix-exporter, run-prefix: "rl60"}
+spec:
+  type: ClusterIP
+  selector: {jobset.sigs.k8s.io/jobset-name: rl60-orch}
+  ports: [{name: metrics, port: 8853, targetPort: 8853}]

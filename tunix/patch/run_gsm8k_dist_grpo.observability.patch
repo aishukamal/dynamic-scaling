@@ -1,0 +1,83 @@
+--- /Users/aishuk/workspaces/tunix-poc/tunix/experimental/examples/math_gsm8k_dist/run_gsm8k_dist_grpo.py	2026-10-14 15:45:57
++++ run_gsm8k_dist_grpo.py	2026-10-14 16:02:17
+@@ -566,6 +566,48 @@
+           rpc_timeout_s=args.rpc_timeout_s,
+       )
+   )
++
++  # --- TUNIX-BASELINE observability patch (console-only; no algorithm change) ---
++  import time as _time  # pylint: disable=g-import-not-at-top
++
++  def _console_metric(name, value, **kw):
++    try:
++      logging.info("METRIC step=%s %s=%s", kw.get("step"), name, float(value))
++    except Exception:  # pylint: disable=broad-exception-caught
++      logging.info("METRIC step=%s %s=%r", kw.get("step"), name, value)
++
++  jax.monitoring.register_scalar_listener(_console_metric)
++
++  def _membership_listener(worker_id, state):
++    logging.info(
++        "MEMBERSHIP t=%.3f worker_id=%s state=%s",
++        _time.time(),
++        worker_id,
++        getattr(state, "value", state),
++    )
++
++  cluster.registry.add_state_listener(_membership_listener)
++
++  def _ft_snapshot(step):
++    try:
++      eng = cluster.engine
++      states = {
++          wid: cluster.registry.state(wid).value
++          for wid in cluster.registry.worker_ids(include_evicted=True)
++      }
++      n_active = len(getattr(eng, "_rollout_workers", []) or []) if eng else -1
++      ftm = eng.fault_tolerance_metrics if eng else {}
++      logging.info(
++          "FTSNAP step=%s t=%.3f active_rollout_workers=%d states=%s ft=%s",
++          step,
++          _time.time(),
++          n_active,
++          states,
++          ftm,
++      )
++    except Exception as e:  # pylint: disable=broad-exception-caught
++      logging.info("FTSNAP step=%s error=%r", step, e)
++  # --- end patch ---
+ 
+   logging.info("Waiting for workers to register via discovery service...")
+   cluster.wait_for_workers(
+@@ -627,15 +669,23 @@
+       max_staleness=args.max_staleness,
+       group_order=args.trajectory_group_order,
+       sync_weights=(args.weight_sync_mode != "none"),
+-      on_step_begin=lambda step: logging.info(
+-          ">>> Step %d starting | Policy Version: %d",
+-          step,
+-          step,
++      on_step_begin=lambda step: (
++          logging.info(
++              ">>> Step %d starting | Policy Version: %d | t=%.3f",
++              step,
++              step,
++              _time.time(),
++          ),
++          _ft_snapshot(step),
+       ),
+-      on_step_end=lambda step, result: logging.info(
+-          "<<< Step %d finished | Advanced to Policy Version: %d",
+-          step,
+-          step + 1,
++      on_step_end=lambda step, result: (
++          logging.info(
++              "<<< Step %d finished | Advanced to Policy Version: %d | t=%.3f",
++              step,
++              step + 1,
++              _time.time(),
++          ),
++          _ft_snapshot(step),
+       ),
+   )
+ 

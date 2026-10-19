@@ -1,0 +1,10 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-f', 'Dockerfile.m3', '-t', 'us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated:v8-rc10-swe1', '.']
+    timeout: 3000s
+images:
+  - 'us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/verl-tpu-colocated:v8-rc10-swe1'
+timeout: 3600s
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 200

@@ -1,0 +1,51 @@
+--- /Users/aishuk/workspaces/tunix-poc/tunix/experimental/rollout/inprocess_vllm_sampler_adapter.py	2026-10-14 15:45:57
++++ /Users/aishuk/workspaces/rl-pool-autoscaler-ops/tunix-reward/patch/inprocess_vllm_sampler_adapter.py	2026-10-15 10:23:48
+@@ -335,6 +335,25 @@
+       sampler_call_kwargs["prompt_token_ids"] = prompt_token_ids_batch
+     else:
+       sampler_call_kwargs["input_strings"] = prompts
++    try:  # TUNIX-REWARD measurement log (first 3 generate calls per worker)
++      self._gencall_n = getattr(self, "_gencall_n", 0) + 1
++      if self._gencall_n <= 3:
++        _p0 = prompts[0] if prompts else None
++        _t0 = prompt_token_ids_batch[0] if prompt_token_ids_batch else None
++        logging.info(
++            "GENCALL n=%d reqs=%d token_prompts=%s temperature=%r top_p=%r"
++            " top_k=%r max_gen=%r logprobs=%r prompt0_len=%s prompt0_head=%r"
++            " prompt0_tail=%r token_prompt0_len=%s token_prompt0_tail=%r",
++            self._gencall_n, len(requests), has_token_prompts, temperature,
++            top_p, top_k, max_generation_steps, return_logprobs,
++            (len(_p0) if isinstance(_p0, str) else None),
++            (_p0[:400] if isinstance(_p0, str) else None),
++            (_p0[-400:] if isinstance(_p0, str) else None),
++            (len(_t0) if _t0 is not None else None),
++            (list(_t0[-12:]) if _t0 is not None else None),
++        )
++    except Exception:  # pylint: disable=broad-exception-caught
++      pass
+ 
+     cancel_event = threading.Event()
+     submitted_request_ids: list[str] = []
+@@ -350,6 +369,22 @@
+       self.vllm_sampler.cancel_requests(submitted_request_ids)
+       raise
+ 
++    try:  # TUNIX-REWARD measurement log
++      if getattr(self, "_gencall_n", 0) <= 3:
++        _t = sampler_output.text
++        _tx0 = _t[0] if isinstance(_t, list) and _t else _t
++        _tk = sampler_output.tokens
++        _tk0 = _tk[0] if isinstance(_tk, list) and _tk else None
++        logging.info(
++            "GENOUT n=%d text0_len=%s ntok0=%s last_tokens=%r text0=%r",
++            self._gencall_n,
++            (len(_tx0) if isinstance(_tx0, str) else None),
++            (len(_tk0) if _tk0 is not None else None),
++            (list(_tk0[-6:]) if _tk0 is not None else None),
++            (_tx0[:700] if isinstance(_tx0, str) else None),
++        )
++    except Exception:  # pylint: disable=broad-exception-caught
++      pass
+     prompt_lengths = getattr(sampler_output, "prompt_lengths", None)
+     responses = []
+     for i, req in enumerate(requests):

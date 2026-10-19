@@ -1,0 +1,12 @@
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-deepswe-raiden-${_STAMP}", "."]
+  - id: smoke
+    name: gcr.io/cloud-builders/docker
+    args: ["run", "--rm", "-w", "/app", "us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-deepswe-raiden-${_STAMP}", "bash", "-c",
+           "python -c \"import jax, vllm, tpu_inference, tunix, tpu_sync; print('jax', jax.__version__, 'vllm', vllm.__version__)\" && python -c \"import agent_sandbox_rl, r2egym, kubernetes, swebench; from agent_sandbox_rl import SandboxFleet; print('agent_sandbox_rl ok')\" && python -c \"from examples.deepswe import sandbox_utils, swe_env, swe_agent; from tunix.experimental.examples.deepswe_dist import deepswe, run_deepswe_dist; print('deepswe imports ok')\" && pip list 2>/dev/null | grep -i -E '^(jax|jaxlib|libtpu|vllm|tpu-inference|flax|numpy|transformers|torch|kubernetes|agent|agentic|k8s-agent|r2egym|openhands|swebench|tpu-sync|tpu_sync|pydantic|httpx) ' && grep -rn -E 'v1alpha1|v1beta1' /opt/venv/lib/python3.12/site-packages/agent_sandbox_rl/ /opt/venv/lib/python3.12/site-packages/agentic_sandbox/ 2>/dev/null | head -40 && echo SMOKE-OK"]
+images: ["us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-deepswe-raiden-${_STAMP}"]
+timeout: 7200s
+substitutions: {_STAMP: "0"}
+options: {machineType: E2_HIGHCPU_32, diskSizeGb: 200}

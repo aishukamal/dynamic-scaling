@@ -1,0 +1,40 @@
+--- /Users/aishuk/workspaces/tunix-poc/examples/deepswe/openhands_utils.py	2026-10-14 15:45:57
++++ /Users/aishuk/workspaces/rl-pool-autoscaler-ops/tunix-reward/patch/openhands_utils.py	2026-10-15 10:23:48
+@@ -898,6 +898,10 @@
+   try:
+     res = _exec_in_sandbox(target, extract_cmd, timeout=timeout)
+     raw_patch, exit_code = _unpack_exec_output(res)
++    logging.info(  # TUNIX-REWARD measurement log
++        "PATCHEXTRACT exit=%s raw_bytes=%d commit=%s",
++        exit_code, len(raw_patch or ""), commit_ref,
++    )
+     if exit_code != 0:
+       logging.warning(
+           "[SWEEnv] Failed to extract git patch from rollout container (exit=%s)",
+@@ -943,6 +947,16 @@
+   3. Applies patch with `git apply --whitespace=fix`; failed apply scores 0.0.
+   4. Runs `runtime.setup_env()` and `_calculate_reward()` in the fresh container.
+   """
++  try:  # TUNIX-REWARD measurement log
++    import hashlib as _hl  # pylint: disable=g-import-not-at-top
++    _p = patch or ""
++    logging.info(
++        "PATCHDUMP bytes=%d sha1=%s files=%r head=%r",
++        len(_p), _hl.sha1(_p.encode("utf-8", "replace")).hexdigest()[:12],
++        re.findall(r"^diff --git a/(\S+)", _p, flags=re.M)[:20], _p[:2000],
++    )
++  except Exception:  # pylint: disable=broad-exception-caught
++    pass
+   if not patch or not patch.strip():
+     logging.info("[SWEEnv] Empty git patch extracted; returning reward 0.0.")
+     return 0.0
+@@ -1028,6 +1042,9 @@
+ 
+     apply_res = runtime.run(apply_cmd, timeout=60)
+     apply_output, apply_exit = _unpack_exec_output(apply_res)
++    logging.info(  # TUNIX-REWARD measurement log
++        "PATCHAPPLY exit=%s out=%r", apply_exit, (apply_output or "")[:500]
++    )
+     if apply_exit != 0:
+       logging.warning(
+           "[SWEEnv] Failed to apply patch in eval container: %s",

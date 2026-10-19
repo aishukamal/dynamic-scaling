@@ -1,0 +1,144 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: rc2b-train
+  namespace: default
+  labels:
+    scheduling.x-k8s.io/gang-id: "rc2b"
+spec:
+  failurePolicy:
+    maxRestarts: 3
+    restartStrategy: Recreate
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: proc
+    template:
+      spec:
+        backoffLimit: 2048000
+        completionMode: Indexed
+        completions: 1
+        parallelism: 1
+        template:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+          spec:
+            serviceAccountName: default
+            dnsPolicy: ClusterFirstWithHostNet
+            hostNetwork: true
+            restartPolicy: OnFailure
+            terminationGracePeriodSeconds: 10
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+              cloud.google.com/gke-tpu-topology: 2x4
+              kubernetes.io/hostname: gke-tpu-0bdace35-z9r3
+            tolerations:
+            - {key: google.com/tpu, operator: Exists, effect: NoSchedule}
+            - {key: cloud.google.com/gke-spot, operator: Equal, value: "true", effect: NoSchedule}
+            # tolerations:
+            # - key: "google.com/tpu"
+            #   operator: "Equal"
+            #   value: "present"
+            #   effect: "NoSchedule"
+            containers:
+            - name: main
+              image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-deepswe-raiden-20261015035906
+              imagePullPolicy: Always
+              securityContext:
+                privileged: true
+              resources:
+                limits:
+                  google.com/tpu: "8"
+                requests:
+                  google.com/tpu: "8"
+              command:
+                - bash
+                - -c
+                - |
+                  # PID 1 wrapper: forwards SIGTERM to background child process so K8s
+                  # termination grace period shuts down workload cleanly without SIGKILL.
+                  # Polling sleep loop ensures bash wakes up promptly to run trap handler.
+
+                  echo "Program Start: $(date)"
+                  _sigterm() (kill -SIGTERM $! 2>/dev/null)
+                  trap _sigterm SIGTERM
+
+                  (
+                           PYTHONUNBUFFERED=1       TUNIX_IS_INTERNAL_ENV=false       WEIGHT_SYNC_DISABLE_TIMEOUTS="0"                     ENABLE_PATHWAYS_PERSISTENCE=0       CHECKPOINT_ASYNC=true              PATHWAYS_CHECKPOINTING_IMPL=persistence              CKPT_D2H_CONCURRENT_GB=8       CKPT_USE_OCDBT=0                            TPU_HOST_BOUNDS=1,1,1 TPU_CHIPS_PER_HOST_BOUNDS=2,4,1 TPU_TOPOLOGY=2x4 TPU_ACCELERATOR_TYPE=v6e-8 TPU_WORKER_ID=0 TPU_WORKER_HOSTNAMES=localhost HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0       RAIDEN_DEVICES_PER_HOST=8       USE_WEIGHT_CONVERTER=true       PREFUSE_MOE_WEIGHTS=false       ROLLOUT_PREFUSE_MOE_WEIGHTS=true       ROLLOUT_MESH_TP=4       ROLLOUT_TENSOR_PARALLEL_SIZE=4       FLOAT32_GATE_LOGITS=true       FLOAT32_LOGITS=true       MAX_GRAD_NORM=1.0       VERIFY_WEIGHTS=false python -m tunix.experimental.distributed.runtime.main         --discovery_addrs=rc2b-orch:20610         --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor         --process_main=tunix.experimental.examples.common.run_trainer_node.main         --worker_id=rc2b-train         --port=20612         --mesh_fsdp=1         --mesh_tp=8         --mesh_expert=1                --trainer_backend=tunix         --model_name=Qwen3-4B         --model_id=Qwen/Qwen3-4B         --model_dir=/tmp/tunix-models/Qwen3-4B         --tokenizer_path=Qwen/Qwen3-4B         --max_prompt_length=2048         --max_response_length=6144         --mini_batch_size=128         --num_generations=4         --train_micro_batch_size=1                  --eval_every_n_steps=1000000         --optimizer_b1=0.9         --optimizer_b2=0.999         --optimizer_eps=1.0e-8         --optimizer_weight_decay=0.01         --optimizer_learning_rate=1e-6         --optimizer_schedule_type=warmup_cosine_decay_schedule         --optimizer_init_value=0.0         --optimizer_peak_value=1e-6         --optimizer_end_value=0.0         --optimizer_warmup_steps=50         --optimizer_decay_steps=500         --lora_rank=64         --lora_alpha=64.0         --sampler_type=inprocess_vllm         --checkpoint_save_interval_steps=5         --checkpoint_max_to_keep=2         --checkpoint_root_directory=/tmp/tunix-ckpt/rc2b-105543         --prefuse_moe_weights=false                --optimizer_opt_chain_type=clip_by_global_norm       --optimizer_chain_kwargs="{'max_norm': 1.0}"                                              
+                  ) & PID=$!
+
+                  while kill -0 $PID 2>/dev/null; do
+                    sleep 5
+                  done
+                  wait $PID
+                  EXIT_CODE=$?
+
+                  echo "Program End: $(date)"
+                  echo "EXIT_CODE=$EXIT_CODE"
+                  exit $EXIT_CODE
+              env:
+              - name: ENABLE_MULTI_NUMA
+                value: "0"
+              - name: TPU_RAIDEN_DATA_NICS
+                value: "eth0"
+              # Injects the JobSet Name
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # Injects the Replicated Job Name
+              - name: REPLICATED_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/replicatedjob-name']
+              # Injects the Job Index (which replica group)
+              - name: JOB_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              # Injects the local Pod Index (if you have multiple completions per job)
+              - name: POD_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+              - name: JAX_PLATFORMS
+                value: "tpu,cpu"
+              - name: VLLM_ENABLE_V1_MULTIPROCESSING
+                value: "0"
+              ports:
+              - containerPort: 20612
+                name: grpc # Naming it 'grpc' tells GKE to optimize for HTTP/2
+              volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - mountPath: /tmp
+                name: shared-tmp
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: shared-tmp
+              hostPath:
+                path: /tmp
+                type: DirectoryOrCreate
+  startupPolicy:
+    startupPolicyOrder: AnyOrder
+  successPolicy:
+    operator: All
+

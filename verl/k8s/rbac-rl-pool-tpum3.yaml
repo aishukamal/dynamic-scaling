@@ -1,0 +1,19 @@
+# RBAC for the controller running in the ray-tpum3 head pod (SA default, ns default): patch the RayCluster sampler worker
+# group (replicas / scaleStrategy.workersToDelete) and read/delete its worker pods (GPU-M2 K8s actuator, k8s_actuator.py).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: rl-pool-controller-tpum3, namespace: default}
+rules:
+- apiGroups: ["ray.io"]
+  resources: ["rayclusters"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: rl-pool-controller-tpum3, namespace: default}
+subjects:
+- {kind: ServiceAccount, name: default, namespace: default}
+roleRef: {kind: Role, name: rl-pool-controller-tpum3, apiGroup: rbac.authorization.k8s.io}

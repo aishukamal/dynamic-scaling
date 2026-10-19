@@ -1,0 +1,149 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: rl60b-roll-1
+  namespace: default
+  labels:
+    scheduling.x-k8s.io/gang-id: "rl60b"
+spec:
+  failurePolicy:
+    maxRestarts: 3
+    restartStrategy: Recreate
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: proc
+    template:
+      spec:
+        backoffLimit: 2048000
+        completionMode: Indexed
+        completions: 1
+        parallelism: 1
+        template:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+          spec:
+            serviceAccountName: default
+            dnsPolicy: ClusterFirstWithHostNet
+            hostNetwork: true
+            restartPolicy: OnFailure
+            terminationGracePeriodSeconds: 10
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+              cloud.google.com/gke-tpu-topology: 2x2
+              kubernetes.io/hostname: gke-tpu-7fb5c8f1-xt33
+            tolerations:
+            - {key: google.com/tpu, operator: Exists, effect: NoSchedule}
+            - {key: cloud.google.com/gke-spot, operator: Equal, value: "true", effect: NoSchedule}
+            # tolerations:
+            # - key: "google.com/tpu"
+            #   operator: "Equal"
+            #   value: "present"
+            #   effect: "NoSchedule"
+            containers:
+            - name: main
+              image: us-west1-docker.pkg.dev/aishuk-test/tpu-poc-repo/tunix-poc:mlperf-65d021b-deepswe-raiden-20261015035906
+              imagePullPolicy: Always
+              securityContext:
+                privileged: true
+              resources:
+                limits:
+                  google.com/tpu: "4"
+                requests:
+                  google.com/tpu: "4"
+              command:
+                - bash
+                - -c
+                - |
+                  # PID 1 wrapper: forwards SIGTERM to background child process so K8s
+                  # termination grace period shuts down workload cleanly without SIGKILL.
+                  # Polling sleep loop ensures bash wakes up promptly to run trap handler.
+
+                  echo "Program Start: $(date)"
+                  _sigterm() (kill -SIGTERM $! 2>/dev/null)
+                  trap _sigterm SIGTERM
+
+                  (
+                    cp /patch/sandbox_utils.py /app/examples/deepswe/sandbox_utils.py && cp /patch/run_deepswe_dist.py /app/tunix/experimental/examples/deepswe_dist/run_deepswe_dist.py && cp /patch/tunix_exporter.py /app/tunix/experimental/examples/deepswe_dist/tunix_exporter.py && cp /patch/swe_agent.py /app/examples/deepswe/swe_agent.py && cp /patch/r2_toolcall.py /app/examples/deepswe/r2_toolcall.py || exit 75
+                             PYTHONUNBUFFERED=1         TUNIX_IS_INTERNAL_ENV=false         TUNIX_DEBUG_INFERENCE_LOGS="true"         EPISODE_TIMEOUT_SECS=5400         WEIGHT_SYNC_DISABLE_TIMEOUTS="0"                  SCAFFOLD="r2egym"                           USE_RAIDEN_FFI=false RAIDEN_USE_FFI=0         RAIDEN_DEVICES_PER_HOST=4         ROLLOUT_PREFUSE_MOE_WEIGHTS=true         ROLLOUT_MESH_TP=4         ROLLOUT_TENSOR_PARALLEL_SIZE=4         PREFUSE_MOE_WEIGHTS=true         FLOAT32_GATE_LOGITS=true         FLOAT32_LOGITS=true         ENABLE_PREFIX_CACHING=false         ROLLOUT_FREE_KV_CACHE=false         IN_FLIGHT_WEIGHT_UPDATES=true         VLLM_MAX_NUM_SEQS=128         VLLM_GPU_MEMORY_UTILIZATION=0.9                                                      RAGGED_GATHER_REDUCE_VERSION=v3                                                                                                                              TPU_SMALL_ALL_REDUCE="1"         TPU_MOE_SINGLE_SORT="1"         TPU_MOE_ROUTER_TOPK="rowmax"         TPU_MOE_LOWTOK="1"         TPU_HOST_BOUNDS=1,1,1 TPU_CHIPS_PER_HOST_BOUNDS=2,2,1 TPU_TOPOLOGY=2x2 TPU_ACCELERATOR_TYPE=v6e-4 TPU_WORKER_ID=0 TPU_WORKER_HOSTNAMES=localhost HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 SANDBOX_RUNTIME_CLASS=gvisor TRAJ_DUMP_DIR=/tmp/tunix-traj/rl60b TOOLCALL_MODE=qwen_json STRIP_THINK=0 TOOLCALL_TOOL_ROLE=1         SKIP_JAX_PRECOMPILE=0 VERIFY_WEIGHTS=false NAMESPACE="agents-system" NODE_SELECTOR_KEY="sandbox.gke.io/runtime" NODE_SELECTOR_VAL="gvisor" IMAGE_REWRITE_PREFIX="us-central1-docker.pkg.dev/aishuk-test/swe-mirror/namanjain12"  JOB_PREFIX="rl60b"    ORCHESTRATOR_ID="rl60b-orch"   SAVE_JAX_CACHE="true" python -m tunix.experimental.distributed.runtime.main           --discovery_addrs=rl60b-orch:20640           --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor           --process_main=tunix.experimental.examples.common.run_rollout_node.main           --worker_id=rl60b-roll-1           --port=20641           --model_id=Qwen/Qwen3-4B           --model_dir=/tmp/tunix-models/Qwen3-4B           --model_name=Qwen3-4B           --tokenizer_path=Qwen/Qwen3-4B           --mesh_fsdp=1           --mesh_tp=4           --max_prompt_length=2048           --max_response_length=6144                      --sampler=inprocess_vllm           --lora_rank=64           --lora_alpha=64.0           --weight_sync_mode=raiden           --prefuse_moe_weights=true           --enable_prefix_caching=false           --free_kv_cache_during_weight_sync=false           --in_flight_weight_updates=true           --priority_scheduling=false           --return_routed_experts=false           --registry_module=tunix.experimental.examples.deepswe_dist.deepswe           --env_name=deepswe_env           --agent_name=deepswe_agent           --max_concurrency=128           --seed=42                                     --tensor_parallel_size=4     --vllm_config_json='{"max_num_seqs": 128}'                     --debug       
+                  ) & PID=$!
+
+                  while kill -0 $PID 2>/dev/null; do
+                    sleep 5
+                  done
+                  wait $PID
+                  EXIT_CODE=$?
+
+                  echo "Program End: $(date)"
+                  echo "EXIT_CODE=$EXIT_CODE"
+                  exit $EXIT_CODE
+              env:
+              - name: ENABLE_MULTI_NUMA
+                value: "0"
+              - name: TPU_RAIDEN_DATA_NICS
+                value: "eth0"
+              # Injects the JobSet Name
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              # Injects the Replicated Job Name
+              - name: REPLICATED_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/replicatedjob-name']
+              # Injects the Job Index (which replica group)
+              - name: JOB_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              # Injects the local Pod Index (if you have multiple completions per job)
+              - name: POD_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+              - name: JAX_PLATFORMS
+                value: "tpu,cpu"
+              - name: VLLM_ENABLE_V1_MULTIPROCESSING
+                value: "0"
+              ports:
+              - containerPort: 20641
+                name: grpc # Naming it 'grpc' tells GKE to optimize for HTTP/2
+              volumeMounts:
+              - name: patch
+                mountPath: /patch
+              - name: dshm
+                mountPath: /dev/shm
+              - mountPath: /tmp
+                name: shared-tmp
+            volumes:
+            - name: patch
+              configMap:
+                name: tunix-deepswe-patch-ctl
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: shared-tmp
+              hostPath:
+                path: /tmp
+                type: DirectoryOrCreate
+  startupPolicy:
+    startupPolicyOrder: AnyOrder
+  successPolicy:
+    operator: All

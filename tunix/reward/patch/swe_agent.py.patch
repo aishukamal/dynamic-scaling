@@ -1,0 +1,31 @@
+--- /Users/aishuk/workspaces/tunix-poc/examples/deepswe/swe_agent.py	2026-10-14 15:45:57
++++ /Users/aishuk/workspaces/rl-pool-autoscaler-ops/tunix-reward/patch/swe_agent.py	2026-10-15 10:23:48
+@@ -387,6 +387,13 @@
+     observation = str(observation)
+     if info is None:
+       info = {}
++    try:  # TUNIX-REWARD measurement log
++      logging.info(
++          "RAWOBS agent=%x step=%d done=%s obs_len=%d obs=%r",
++          id(self), self.step, done, len(observation), observation[:700],
++      )
++    except Exception:  # pylint: disable=broad-exception-caught
++      pass
+     # If it's the first step in environment, let's apply user prompt template
+     if len(self._trajectory.steps) == 0:
+       observation = self.user_prompt_template.format(
+@@ -477,6 +484,14 @@
+     cur_step.thought = thought
+     cur_step.action = action_str
+     cur_step.model_response = response
++    try:  # TUNIX-REWARD measurement log
++      logging.info(
++          "RAWRESP agent=%x step=%d fn=%r resp_len=%d resp=%r",
++          id(self), self.step, getattr(action, "function_name", ""),
++          len(response or ""), (response or "")[:1500],
++      )
++    except Exception:  # pylint: disable=broad-exception-caught
++      pass
+ 
+     # Update Chat Completions
+     if self.format_model_response:

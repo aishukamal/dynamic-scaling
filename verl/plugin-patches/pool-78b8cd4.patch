@@ -1,0 +1,78 @@
+From 78b8cd421e0da9bfff1501e8fd5dcc5618ef2111 Mon Sep 17 00:00:00 2001
+From: Aishu Kamal <aishuk@google.com>
+Date: Fri, 16 Oct 2026 12:16:48 -0700
+Subject: [PATCH] tpu pool control: confirm a dead replica by Ray actor state
+ before the detection-time destroy (slow engine != dead engine)
+
+---
+ .../tpu/engines/tpu_pool_control.py           | 37 ++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+index 906dfa3..d406e43 100644
+--- a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
++++ b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+@@ -274,9 +274,20 @@ class PoolHook:
+                     self.log("health_probe_failed", rank=rank, n=failures[rank], error=repr(e)[:300])
+                     if failures[rank] < needed:
+                         continue
++                    states = self._actor_states(r) if self.join_on_ready else None
++                    if states is not None and states and all(v == "ALIVE" for v in states.values()):
++                        # Every server/worker actor is alive: a slow engine (first-bucket compile), not a dead one. With the
++                        # detection-time destroy a false positive would kill a healthy replica (tpum3-dyn3 19:13:23Z), so
++                        # keep probing without touching the LB until the probes have failed for hung_after_s.
++                        since = time.perf_counter() - first_fail[rank][1]
++                        if since < float(self.cfg.get("hung_after_s", 300.0)):
++                            self.log("health_probe_slow", rank=rank, n=failures[rank], since_first_fail_s=since,
++                                     actor_states=states)
++                            continue
+                     t_detect = time.perf_counter()
+                     info = {"t_detect": _utc(), "mono_detect": t_detect, "probe_s": t_detect - t0, "error": repr(e)[:400],
+-                            "t_first_fail": first_fail[rank][0], "first_fail_to_detect_s": t_detect - first_fail[rank][1]}
++                            "t_first_fail": first_fail[rank][0], "first_fail_to_detect_s": t_detect - first_fail[rank][1],
++                            "actor_states": states}
+                     try:
+                         ray.get(self.lb.remove_servers.remote([r.server_address]), timeout=30)
+                         info["lb_removed_s"] = time.perf_counter() - t_detect
+@@ -413,6 +424,24 @@ class PoolHook:
+             else:
+                 self.log("spawn_refused", reason="max_rank reached", next_rank=self.next_rank)
+ 
++    def _actor_states(self, r: Any) -> Optional[dict[str, str]]:
++        """Ray actor state (ALIVE/DEAD/...) of the replica's server and worker actors, from the GCS (no RPC into the
++        engine); None when the state API is unavailable. A SIGKILLed worker process shows DEAD within seconds."""
++        try:
++            from ray.util.state import get_actor
++        except Exception:  # noqa: BLE001
++            return None
++        out: dict[str, str] = {}
++        try:
++            for kind, handles in (("server", getattr(r, "servers", None) or []), ("worker", getattr(r, "workers", None) or [])):
++                for i, h in enumerate(handles):
++                    st = get_actor(id=h._actor_id.hex(), timeout=10)
++                    out[f"{kind}{i}"] = str(getattr(st, "state", None) or "MISSING") if st is not None else "MISSING"
++        except Exception as e:  # noqa: BLE001
++            self.log("actor_state_error", rank=getattr(r, "replica_rank", None), error=repr(e)[:200])
++            return None
++        return out
++
+     def _sampleable(self) -> Optional[int]:
+         rb = getattr(self.trainer, "replay_buffer", None)
+         fn = getattr(rb, "get_sampleable_count", None)
+@@ -853,8 +882,12 @@ class PoolHook:
+                 await asyncio.wait_for(r.server_handle.collective_rpc.remote(method="check_health"), timeout=timeout)
+             except Exception as e:  # noqa: BLE001
+                 t_detect = time.perf_counter()
++                states = self._actor_states(r) if self.join_on_ready else None
++                if states is not None and states and all(v == "ALIVE" for v in states.values()):
++                    self.log("presync_slow", rank=rank, probe_s=t_detect - t0, error=repr(e)[:200], actor_states=states)
++                    continue
+                 info = {"t_detect": _utc(), "mono_detect": t_detect, "probe_s": t_detect - t0, "error": repr(e)[:400],
+-                        "source": "presync"}
++                        "source": "presync", "actor_states": states}
+                 try:
+                     await self.lb.remove_servers.remote([r.server_address])
+                     info["lb_removed_s"] = time.perf_counter() - t_detect
+-- 
+2.56.0.rc1.315.gc6ed9934b7-goog
+

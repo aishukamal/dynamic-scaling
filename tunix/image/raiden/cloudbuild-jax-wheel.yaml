@@ -1,0 +1,36 @@
+# Builds tpu_sync_jax (Raiden, JAX flavour) from google/tpu-sync main with the repo's own ci/build_wheel_impl.sh
+# inside the upstream ml-build container, against JAX 0.11.0 (the Tunix image's jax pin; Tunix's own pinned wheel
+# carries build tag 0110 = JAX 0.11.0). Output -> gs://aishuk-test-tpu-sync-wheels/<stamp>/.
+steps:
+- name: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+  id: build-wheel
+  entrypoint: bash
+  env:
+  - BUILD_MODE=jax
+  - RAIDEN_JAX_VERSION=0.11.0
+  - WHEEL_VERSION_EXTRAS=.dev${_STAMP}
+  - BAZEL_CACHE_DIR=/workspace/.bazel_cache
+  - BAZEL_OUTPUT_BASE=/workspace/.bazel_out
+  - HOME=/root
+  args:
+  - -c
+  - |
+    set -euo pipefail
+    cd /workspace/tpu-sync
+    echo "TPU_SYNC_COMMIT=$(cat TPU_SYNC_COMMIT)"; nproc; free -g; df -h /workspace | tail -1
+    python3 --version; which python3
+    bash ci/build_wheel_impl.sh
+    ls -la dist
+    sha256sum dist/*.whl
+  timeout: 21000s
+artifacts:
+  objects:
+    location: gs://aishuk-test-tpu-sync-wheels/${_STAMP}/
+    paths: ['tpu-sync/dist/*.whl', 'tpu-sync/TPU_SYNC_COMMIT']
+timeout: 21600s
+substitutions:
+  _STAMP: '0'
+options:
+  logging: CLOUD_LOGGING_ONLY
+  pool:
+    name: projects/aishuk-test/locations/us-west1/workerPools/tpu-sync-pool

@@ -1,0 +1,21 @@
+[project]
+name = "rl-pool-autoscaler"
+version = "0.1.0"
+description = "Out-of-tree verl plugin + Kubernetes controller for an elastic standalone sampler pool"
+requires-python = ">=3.10"
+dependencies = []   # plugin side runs inside the verl image; controller side is stdlib-only
+
+[project.optional-dependencies]
+# Register the plugin module with verl's entry-point loader (import verl -> import rl_pool_autoscaler.plugin_entry).
+# Not needed for the ray-job working_dir path used by the PoC.
+verl = []
+
+[project.entry-points."verl.plugins"]
+rl_pool_autoscaler = "rl_pool_autoscaler"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rl_pool_autoscaler*"]

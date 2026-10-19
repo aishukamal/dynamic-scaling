@@ -1,0 +1,260 @@
+From ebfeee6527bdbbdce5cb8a460723403284567b1b Mon Sep 17 00:00:00 2001
+From: Aishu Kamal <aishuk@google.com>
+Date: Fri, 16 Oct 2026 11:43:40 -0700
+Subject: [PATCH] tpu pool control: join_on_ready (joiner-only Raiden push when
+ the spawned engine is ready, detection-time repair); unique transfer req_id
+ per push
+
+---
+ .../tpu/engines/raiden_checkpoint_engine.py   |   7 +-
+ .../tpu/engines/tpu_pool_control.py           | 158 ++++++++++++++++++
+ 2 files changed, 164 insertions(+), 1 deletion(-)
+
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/raiden_checkpoint_engine.py b/verl_hardware_plugin/accelerators/tpu/engines/raiden_checkpoint_engine.py
+index 28be0c0..ecea392 100644
+--- a/verl_hardware_plugin/accelerators/tpu/engines/raiden_checkpoint_engine.py
++++ b/verl_hardware_plugin/accelerators/tpu/engines/raiden_checkpoint_engine.py
+@@ -708,6 +708,9 @@ def _sampler_rank_offsets(replicas: Any) -> list[int]:
+     return offsets
+ 
+ 
++REQ_ID_SUFFIX = ""  # appended to the transfer req_id (see raiden_transfer); set by the pool hook for joiner-only pushes
++
++
+ def _sampler_unit_offsets(manager: Any) -> list[int]:
+     """Sticky global Raiden unit offset of every replica currently in ``manager.replicas``.
+ 
+@@ -850,7 +853,9 @@ async def raiden_transfer(manager: Any, global_steps: Optional[int] = None, awai
+         is_sender=True,
+         expected_block_count=0,
+         parallelism=parallelism,
+-        req_id=f"verl_step_{global_steps or 0}",
++        # The controller returns the existing (completed) future for a repeated req_id, i.e. a silent no-op; a pool
++        # hook that pushes the same version a second time (joiner-only sync) sets REQ_ID_SUFFIX to keep ids unique.
++        req_id=f"verl_step_{global_steps or 0}{REQ_ID_SUFFIX}",
+     )
+     await transfer_future.wait()
+     t_transfer = time.perf_counter() - t_transfer_start
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+index 3de2f00..906dfa3 100644
+--- a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
++++ b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+@@ -23,6 +23,10 @@ join   = TPUWorker.wake_up(weights, kv_cache) -> manager.add_replicas -> [sync i
+ spawn  = (``spawn: true``) a NEW replica process set through ``RolloutReplica.init_standalone`` in a background
+          thread, then the join path at the next sync (the fresh-pod product path, measured here as
+          request -> process ready -> version installed -> first token).
++join_on_ready = (``join_on_ready: true``) no sync-boundary wait: when the spawned engine is ready, a joiner-only
++         Raiden push of the trainer's current clean weights (gated on an actor update in progress finishing, not
++         on a whole version), membership add and LB add at once; a replica found dead is removed, destroyed and
++         replaced at detection time. One lock serialises the push, the actor update and the regular sync.
+ """
+ 
+ import asyncio
+@@ -37,6 +41,7 @@ from typing import Any, Optional
+ 
+ import ray
+ 
++from verl_hardware_plugin.accelerators.tpu.engines import raiden_checkpoint_engine as _rce
+ from verl_hardware_plugin.accelerators.tpu.engines.raiden_checkpoint_engine import update_raiden_weights
+ 
+ logger = logging.getLogger(__name__)
+@@ -113,6 +118,15 @@ class PoolHook:
+         self.initial_done = False
+         self._lock = threading.Lock()
+         self._stop = threading.Event()
++        # join_on_ready (TPU-M3 dyn3): one lock serialises everything that reads or writes the trainer's weights or the
++        # Raiden membership: the regular sync (around), the actor update (wrapped _update_actor), a joiner-only push
++        # (_join_on_ready) and a detection-time repair (_repair_dead_now). _actor_updated_pending marks "update_actor of
++        # this step finished, its sync has not run yet", which is the only case where the clean version is last+1.
++        self._sync_lock = threading.Lock()
++        self._actor_busy = False
++        self._actor_updated_pending = False
++        self._trainer_blocked_s = 0.0
++        self.join_on_ready = bool(cfg.get("join_on_ready", False))
+         self._inflight: dict[str, int] = {}
+         self._logger_wrapped = False
+         # Slot utilization (TPU-M3): per-replica slot cap = vLLM max_num_seqs (the admission cap the V1 path lacks); the LB
+@@ -135,6 +149,8 @@ class PoolHook:
+         self.ctrl = self._create_actor()
+         self.log("init", replicas=sorted(self.all), addresses=self.addresses(), cfg=cfg, actor=str(self.ctrl),
+                  actor_host=self.actor_host, port=int(cfg.get("port", 8787)))
++        if self.join_on_ready:
++            self._wrap_update_actor()
+         threading.Thread(target=self._lb_sampler, name="pool-lb-sampler", daemon=True).start()
+         threading.Thread(target=self._watchdog, name="pool-watchdog", daemon=True).start()
+         if self.cfg.get("spawn", False) and self.cfg.get("early_spawn", False):
+@@ -270,8 +286,133 @@ class PoolHook:
+                         self.dead[rank] = info
+                     self.log("dead_detected", rank=rank, **info, active=list(self.active))
+                     self._report()
++                    if self.join_on_ready:
++                        try:
++                            self._repair_dead_now(rank)
++                        except Exception as e3:  # noqa: BLE001
++                            self.log("repair_error", rank=rank, error=repr(e3)[:400])
+             time.sleep(poll)
+ 
++    # ------------------------------------------------------------------ join_on_ready (no sync-boundary wait)
++    def _wrap_update_actor(self) -> None:
++        """Wraps the trainer's actor update so a joiner-only push never overlaps a weight update: the push waits for
++        an update in progress (wait-for-clean-weights), and an update waits for a push in progress (recorded)."""
++        orig = self.trainer._update_actor
++        hook = self
++
++        def wrapped(*args: Any, **kwargs: Any) -> Any:
++            t0 = time.perf_counter()
++            with hook._sync_lock:
++                waited = time.perf_counter() - t0
++                if waited > 0.5:
++                    hook._trainer_blocked_s += waited
++                    hook.log("trainer_blocked_by_join", waited_s=waited, total_blocked_s=hook._trainer_blocked_s)
++                hook._actor_busy = True
++                try:
++                    return orig(*args, **kwargs)
++                finally:
++                    hook._actor_busy = False
++                    hook._actor_updated_pending = True
++
++        self.trainer._update_actor = wrapped
++        self.log("update_actor_wrapped")
++
++    def _clean_version(self) -> int:
++        """Version of the trainer's weights while _sync_lock is held and no update is running."""
++        return int(self.last_sync_version or 0) + (1 if self._actor_updated_pending else 0)
++
++    def _join_on_ready(self, rank: int, replica: Any, sp: dict) -> None:
++        """Spawned replica -> serving without waiting for the next sync: joiner-only Raiden push of the current clean
++        weights (manager.replicas swapped to [replica] for the push, unique transfer req_id), membership add, LB add."""
++        rec: dict[str, Any] = {"rank": rank, "actor_busy_at_request": self._actor_busy,
++                               "t_request_push": _utc()}
++        t_req = time.perf_counter()
++        with self._sync_lock:
++            t_lock = time.perf_counter()
++            rec["wait_clean_weights_s"] = t_lock - t_req
++            with self._lock:
++                already = rank in self.active or rank not in self.spawn_ready or rank not in self.all
++            if already:
++                self.log("join_on_ready_skipped", **rec, reason="already joined at a sync or gone", active=list(self.active))
++                return
++            version = self._clean_version()
++            rec["version"] = version
++            rec["actor_updated_pending"] = self._actor_updated_pending
++            saved = list(self.manager.replicas)
++            self.manager.replicas = [replica]
++            _rce.REQ_ID_SUFFIX = f"_join{rank}_{int(time.time())}"
++            try:
++                metrics = asyncio.run(update_raiden_weights(self.manager, global_steps=version))
++                rec["sync_error"] = None
++            except Exception as e:  # noqa: BLE001
++                metrics = {}
++                rec["sync_error"] = repr(e)[:600]
++            finally:
++                _rce.REQ_ID_SUFFIX = ""
++                self.manager.replicas = saved
++            t_sync = time.perf_counter()
++            rec["joiner_sync_s"] = t_sync - t_lock
++            rec["phases"] = {k.split("/")[-1]: v for k, v in (metrics or {}).items() if k.startswith("timing_s/tpu-sync/")}
++            if rec["sync_error"]:
++                self.log("join_on_ready_error", **rec, active=list(self.active))
++                return
++            self.manager.add_replicas([replica])
++            try:
++                ray.get(self.lb.add_servers.remote({replica.server_address: replica.server_handle}), timeout=60)
++                rec["cleared"] = ray.get(self.lb.clear_sticky_cache.remote(), timeout=60)
++            except Exception as e:  # noqa: BLE001
++                rec["lb_add_error"] = repr(e)[:300]
++            t_lb = time.perf_counter()
++            rec["lb_add_s"] = t_lb - t_sync
++            self.versions[rank] = version
++            with self._lock:
++                if rank in self.spawn_ready:
++                    self.spawn_ready.remove(rank)
++                self.active.append(rank)
++        placed = sp.get("mono_placed", sp.get("mono_start"))
++        sp.update(joined_on_ready=True, t_serving=_utc(), version=version,
++                  pod_ray_s=(placed - sp["mono_start"]) if placed is not None else None,
++                  engine_init_s=(sp["mono_ready"] - placed) if placed is not None else None,
++                  wait_clean_weights_s=rec["wait_clean_weights_s"], joiner_sync_s=rec["joiner_sync_s"], lb_add_s=rec["lb_add_s"],
++                  ready_to_serving_s=t_lb - sp["mono_ready"],
++                  req_to_serving_s=(t_lb - sp["t_request"]) if sp.get("t_request") else None)
++        self.log("join_on_ready", **rec, **{k: v for k, v in sp.items() if not k.startswith("mono") and k not in rec},
++                 active=list(self.active), manager_replicas=[x.replica_rank for x in self.manager.replicas])
++        self._report()
++
++    def _repair_dead_now(self, rank: int) -> None:
++        """Detection-time repair (join_on_ready): membership removal + destroy as soon as the watchdog marks a replica
++        dead, then a replacement spawn if the controller's desired count exceeds what the pool has."""
++        t0 = time.perf_counter()
++        with self._sync_lock:
++            waited = time.perf_counter() - t0
++            r = self.all.get(rank)
++            if rank in self.dead_in_manager or r is None:
++                return
++            if any(x is r for x in self.manager.replicas):
++                self.manager.remove_replicas([r])
++            self.dead_in_manager.add(rank)
++            with self._lock:
++                if rank in self.active:
++                    self.active.remove(rank)
++            self.log("dead_removed", rank=rank, source="watchdog", waited_lock_s=waited, active=list(self.active),
++                     manager_replicas=[x.replica_rank for x in self.manager.replicas])
++            if self.cfg.get("destroy_dead", True):
++                asyncio.run(self.destroy(rank, "dead"))
++        try:
++            desired = int(ray.get(self.ctrl.get_desired.remote(), timeout=10))
++        except Exception as e:  # noqa: BLE001
++            self.log("desired_error", error=repr(e)[:200], source="repair")
++            return
++        with self._lock:
++            have = len(self.active) + len(self.parked) + len(self.spawn_ready)
++        if desired > have and self.cfg.get("spawn", False) and not self.spawning:
++            if self.next_rank < int(self.cfg.get("max_rank", 8)):
++                self.log("replacement_spawn", desired=desired, have=have, dead_rank=rank)
++                self.start_spawn(t_request=t0)
++            else:
++                self.log("spawn_refused", reason="max_rank reached", next_rank=self.next_rank)
++
+     def _sampleable(self) -> Optional[int]:
+         rb = getattr(self.trainer, "replay_buffer", None)
+         fn = getattr(rb, "get_sampleable_count", None)
+@@ -565,6 +706,8 @@ class PoolHook:
+                 attempts = int(self.cfg.get("spawn_retries", 12))
+                 for attempt in range(attempts + 1):
+                     try:
++                        rec["mono_placed"] = time.perf_counter()  # start of the attempt that ends up succeeding
++                        rec["attempts"] = attempt + 1
+                         asyncio.run(replica.init_standalone())
+                         break
+                     except ValueError as e:
+@@ -589,6 +732,8 @@ class PoolHook:
+                 except Exception:  # noqa: BLE001
+                     pass
+                 self.log("spawn_ready", **{k: v for k, v in rec.items() if not k.startswith("mono")})
++                if self.join_on_ready:
++                    self._join_on_ready(rank, replica, rec)
+             except Exception as e:  # noqa: BLE001
+                 rec["error"] = repr(e)[:800]
+                 self.log("spawn_error", rank=rank, error=rec["error"])
+@@ -600,6 +745,19 @@ class PoolHook:
+ 
+     # ------------------------------------------------------------------ the sync wrapper
+     async def around(self, global_steps: Optional[int]) -> dict:
++        if not self.join_on_ready:
++            return await self._around(global_steps)
++        t0 = time.perf_counter()
++        with self._sync_lock:
++            waited = time.perf_counter() - t0
++            if waited > 0.5:
++                self.log("sync_waited_for_join", waited_s=waited, global_steps=global_steps)
++            try:
++                return await self._around(global_steps)
++            finally:
++                self._actor_updated_pending = False
++
++    async def _around(self, global_steps: Optional[int]) -> dict:
+         idx = self.n_sync
+         self._wrap_logger_once()
+         joiners: list[int] = []
+-- 
+2.56.0.rc1.315.gc6ed9934b7-goog
+

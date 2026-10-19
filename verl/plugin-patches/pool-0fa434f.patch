@@ -1,0 +1,35 @@
+From 0fa434f33545dea9799c0f67b051a9f0d86d785d Mon Sep 17 00:00:00 2001
+From: Aishu Kamal <aishuk@google.com>
+Date: Fri, 16 Oct 2026 20:15:17 -0700
+Subject: [PATCH] tpu pool control: skip the Raiden sync when no replica is
+ alive (replacement still initialising) instead of failing the trainer
+
+---
+ .../accelerators/tpu/engines/tpu_pool_control.py      | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+index 548647a..eaedd85 100644
+--- a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
++++ b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+@@ -854,6 +854,17 @@ class PoolHook:
+         sampleable = self._sampleable()
+         self.log("sync_begin", global_steps=global_steps, manager_replicas=units, desired=desired,
+                  joiners=joiners, sampleable=sampleable, active=list(self.active), parked=list(self.parked))
++        if not self.manager.replicas:
++            # No live replica (the only one was destroyed after a failure and its replacement is still initialising): a
++            # Raiden sync has no destination ("dst_units must not be empty" ended tpum3-r2c at version 13). Skip it; the
++            # replacement receives this version through its on-demand joiner push (join_on_ready) or the next sync.
++            self.last_sync_wall = 0.0
++            self.last_sync_version = int(global_steps or 0)
++            self.log("sync_skipped_no_replicas", global_steps=global_steps, spawning=self.spawning,
++                     spawn_ready=list(self.spawn_ready))
++            self.n_sync += 1
++            self._report(sampleable=sampleable, last_sync_phases={})
++            return {}
+         t0 = time.perf_counter()
+         metrics = await update_raiden_weights(self.manager, global_steps=global_steps)
+         sync_s = time.perf_counter() - t0
+-- 
+2.56.0.rc1.315.gc6ed9934b7-goog
+

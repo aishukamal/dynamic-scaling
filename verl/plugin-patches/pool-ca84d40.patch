@@ -1,0 +1,42 @@
+From ca84d40887ba0b6d1a5da61721de391dac50518f Mon Sep 17 00:00:00 2001
+From: Aishu Kamal <aishuk@google.com>
+Date: Fri, 16 Oct 2026 15:25:30 -0700
+Subject: [PATCH] tpu pool control: only a probe timeout is checked against
+ actor state; any other probe error (EngineDeadError) is a dead engine
+
+---
+ .../accelerators/tpu/engines/tpu_pool_control.py      | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+index d406e43..51f8b24 100644
+--- a/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
++++ b/verl_hardware_plugin/accelerators/tpu/engines/tpu_pool_control.py
+@@ -274,7 +274,13 @@ class PoolHook:
+                     self.log("health_probe_failed", rank=rank, n=failures[rank], error=repr(e)[:300])
+                     if failures[rank] < needed:
+                         continue
+-                    states = self._actor_states(r) if self.join_on_ready else None
++                    # Only a TIMEOUT is ambiguous (slow engine vs dead engine). Any other error (EngineDeadError after a
++                    # SIGKILLed vLLM worker, an actor-died error) is a dead engine: the chip-holding RayWorkerWrapper actors
++                    # belong to vLLM's executor, not to ``r.workers``, so their death does not show in the actor-state check
++                    # (tpum3-dyn3 failure act 22:21:44Z: EngineDeadError from 22:22:19Z, every listed actor ALIVE, the dead
++                    # path only opened after hung_after_s).
++                    is_timeout = isinstance(e, ray.exceptions.GetTimeoutError) or "GetTimeoutError" in repr(e)
++                    states = self._actor_states(r) if (self.join_on_ready and is_timeout) else None
+                     if states is not None and states and all(v == "ALIVE" for v in states.values()):
+                         # Every server/worker actor is alive: a slow engine (first-bucket compile), not a dead one. With the
+                         # detection-time destroy a false positive would kill a healthy replica (tpum3-dyn3 19:13:23Z), so
+@@ -882,7 +888,8 @@ class PoolHook:
+                 await asyncio.wait_for(r.server_handle.collective_rpc.remote(method="check_health"), timeout=timeout)
+             except Exception as e:  # noqa: BLE001
+                 t_detect = time.perf_counter()
+-                states = self._actor_states(r) if self.join_on_ready else None
++                is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or "Timeout" in repr(e)
++                states = self._actor_states(r) if (self.join_on_ready and is_timeout) else None
+                 if states is not None and states and all(v == "ALIVE" for v in states.values()):
+                     self.log("presync_slow", rank=rank, probe_s=t_detect - t0, error=repr(e)[:200], actor_states=states)
+                     continue
+-- 
+2.56.0.rc1.315.gc6ed9934b7-goog
+

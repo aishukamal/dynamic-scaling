@@ -1,0 +1,1561 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CPU control-plane for the experimental distributed DeepSWE GRPO demo."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Callable
+import functools
+import logging
+import os
+import signal
+import sys
+from typing import Any
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+import jax  # pylint: disable=g-import-not-at-top
+from transformers import AutoTokenizer  # pylint: disable=g-import-not-at-top
+
+REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+)
+if REPO_ROOT not in sys.path:
+  sys.path.insert(0, REPO_ROOT)
+
+# pylint: disable=g-import-not-at-top
+from tunix.experimental.common import datatypes
+from tunix.experimental.distributed.runtime import context as runtime_context
+from tunix.experimental.examples.deepswe_dist import trainer_warmup
+from tunix.experimental.orchestrator import algorithm_adapter
+from tunix.experimental.orchestrator import batch_assembly
+from tunix.experimental.orchestrator import orchestrator
+from tunix.experimental.orchestrator import rl_program
+from tunix.experimental.weight_sync import weight_sync
+from tunix.experimental.weight_sync import weight_sync_coordinator
+from tunix.experimental.worker import remote_execution
+from tunix.rl import algorithm_config
+from tunix.sft import metrics_logger as metrics_logger_lib
+from tunix.utils import mllog_utils
+
+# pylint: enable=g-import-not-at-top
+
+
+ProcessContext = runtime_context.ProcessContext
+DEFAULT_DATASET_NAME = "R2E-Gym/R2E-Gym-Subset"
+
+
+def _int_list(value: str) -> tuple[int, ...]:
+  """Parses "512,2048" into (512, 2048)."""
+  return tuple(int(part) for part in value.split(",") if part)
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+  parser = argparse.ArgumentParser(
+      description="Orchestrator V2 DeepSWE distributed GRPO demo."
+  )
+  parser.add_argument("--batch_size", type=int, default=1)
+  parser.add_argument(
+      "--mini_batch_size",
+      type=int,
+      default=None,
+      help=(
+          "Number of prompt groups per optimizer update. Defaults to"
+          " batch_size."
+      ),
+  )
+  parser.add_argument("--num_generations", type=int, default=2)
+  parser.add_argument(
+      "--num_generations_to_dispatch",
+      type=int,
+      default=None,
+      help=(
+          "Number of trajectories to dispatch per prompt for intra-prompt"
+          " over-generation. Defaults to num_generations."
+      ),
+  )
+  parser.add_argument(
+      "--prefer_valid_rollouts",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "When over-generating, prefer valid rollouts over truncated or"
+          " timed-out rollouts before sealing a group."
+      ),
+  )
+  parser.add_argument(
+      "--rollout_replicas",
+      type=int,
+      default=(
+          int(val)
+          if (
+              val := (
+                  os.getenv("ROLLOUT_REPLICAS")
+                  or os.getenv("ROLLOUT_WORKERS")
+                  or ""
+              ).strip()
+          )
+          else 1
+      ),
+      help=(
+          "Minimum number of rollout worker replicas to wait for before"
+          " starting training."
+      ),
+  )
+  parser.add_argument(
+      "--rollout_fault_tolerance",
+      action=argparse.BooleanOptionalAction,
+      default=os.getenv("ROLLOUT_FAULT_TOLERANCE", "true").strip().lower()
+      not in ("0", "false", "no"),
+      help=(
+          "Enable rollout worker fault tolerance (eviction, retry, and dynamic "
+          "rejoin)."
+      ),
+  )
+  parser.add_argument(
+      "--max_concurrent_rollouts_per_worker",
+      type=int,
+      default=(
+          int(val)
+          if (val := os.getenv("MAX_CONCURRENT_ROLLOUTS_PER_WORKER", "").strip())
+          else None
+      )
+      or None,
+      help=(
+          "Optional cap on concurrent in-flight rollouts dispatched to any "
+          "single rollout worker."
+      ),
+  )
+  parser.add_argument(
+      "--rollout_task_timeout_s",
+      type=float,
+      default=(
+          float(val)
+          if (val := os.getenv("ROLLOUT_TASK_TIMEOUT_S", "").strip())
+          else None
+      )
+      or None,
+      help=(
+          "Optional per-task execution timeout in seconds once a rollout "
+          "request is dispatched to a worker."
+      ),
+  )
+  parser.add_argument(
+      "--max_zero_worker_wait_s",
+      type=float,
+      default=(
+          float(val)
+          if (val := os.getenv("MAX_ZERO_WORKER_WAIT_S", "").strip())
+          else 600.0
+      ),
+      help=(
+          "Maximum duration in seconds to wait when zero active rollout "
+          "workers remain before raising NoHealthyRolloutWorkersError."
+      ),
+  )
+  parser.add_argument(
+      "--rollout_max_task_retries",
+      type=int,
+      default=(
+          int(val)
+          if (val := os.getenv("ROLLOUT_MAX_TASK_RETRIES", "").strip())
+          else 3
+      ),
+      help=(
+          "Maximum number of retry attempts per rollout request_id before "
+          "synthesizing a terminal FAILED placeholder trajectory."
+      ),
+  )
+  parser.add_argument(
+      "--recover_unknown_transfer_state",
+      action=argparse.BooleanOptionalAction,
+      default=os.getenv("RECOVER_UNKNOWN_TRANSFER_STATE", "false")
+      .strip()
+      .lower()
+      in ("1", "true", "yes"),
+      help=(
+          "Attempt recovery from RoundState.UNKNOWN_TRANSFER_STATE during "
+          "weight sync by evicting uncommitted workers and retrying once."
+      ),
+  )
+  parser.add_argument("--max_steps", type=int, default=1)
+  parser.add_argument("--max_prompt_length", type=int, default=1024)
+  parser.add_argument("--max_response_length", type=int, default=1024)
+  parser.add_argument("--train_micro_batch_size", type=int, default=1)
+  parser.add_argument(
+      "--max_seq_token_per_tpu",
+      type=int,
+      default=None,
+      help=(
+          "Maximum sequence tokens per TPU for sequence packing. When"
+          " configured, SequencePackedBatchAssembler is used instead of"
+          " PaddedBatchAssembler."
+      ),
+  )
+  parser.add_argument(
+      "--max_segments_per_packed_row",
+      type=int,
+      default=None,
+      help="Maximum segments per packed row when sequence packing is enabled.",
+  )
+  # TODO(tunix-dev): Clean up worker specific configuration to orchestrator.
+  parser.add_argument(
+      "--trainer_fsdp",
+      type=int,
+      default=None,
+      help=(
+          "Trainer FSDP mesh dimension size for sequence packing pack_size"
+          " computation."
+      ),
+  )
+  parser.add_argument(
+      "--trainer_dp",
+      type=int,
+      default=None,
+      help=(
+          "Trainer DP mesh dimension size for sequence packing pack_size"
+          " computation."
+      ),
+  )
+  parser.add_argument(
+      "--trainer_expert",
+      type=int,
+      default=None,
+      help=(
+          "Trainer expert-parallel mesh dimension. Included in the sequence"
+          " packing row count because MaxText's MoE shards the batch axis over"
+          " ('fsdp','expert') jointly."
+      ),
+  )
+  parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-1.7B")
+  parser.add_argument("--tokenizer_path", type=str, default="")
+  parser.add_argument("--temperature", type=float, default=1.0)
+  parser.add_argument("--top_p", type=float, default=1.0)
+  parser.add_argument("--top_k", type=int, default=-1)
+  parser.add_argument("--beta", type=float, default=0.0)
+  parser.add_argument("--epsilon", type=float, default=0.2)
+  parser.add_argument(
+      "--use_rollout_logps",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "Use rollout sampler log-probs as old_per_token_logps (off-policy /"
+          " sampler importance ratio). Default True matches the"
+          " non-experimental GRPOConfig; pass --no-use_rollout_logps for"
+          " on-policy ratio=1."
+      ),
+  )
+  parser.add_argument(
+      "--exact_token_continuity",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "Preserve exact token IDs across multi-turn rollout steps without"
+          " detokenizing and re-tokenizing intermediate turns (TITO)."
+      ),
+  )
+  parser.add_argument(
+      "--checkpoint_optimizer_interval_steps",
+      type=int,
+      default=1,
+      help=(
+          "Include the optimizer state in a checkpoint only every this many"
+          " optimizer steps (and on the last step); other checkpoints hold"
+          " just the model params. 0 never includes it, so every checkpoint"
+          " is params-only and the run cannot be resumed."
+      ),
+  )
+  parser.add_argument(
+      "--async_weight_sync",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Run each step's weight sync in the background: the trainer waits"
+          " only for the source snapshot, not the transfer. Needs a source"
+          " that transfers from host staging"
+          " (RAIDEN_FFI_USE_DIRECT_DEVICE_BUFFER=0)."
+      ),
+  )
+  parser.add_argument(
+      "--pipeline_train_microbatches",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Pack the next training microbatch in a worker thread while the"
+          " previous one's train_step is still running on the trainer."
+      ),
+  )
+  parser.add_argument(
+      "--in_flight_weight_updates",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "The rollouts pause and resume in-flight requests across a weight"
+          " sync. Lets the dispatcher release each prompt batch as soon as"
+          " the rollouts commit a version recent enough for it."
+      ),
+  )
+  parser.add_argument(
+      "--rollout_priority_scheduling",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Stamp each rollout request with its prompt batch index as its"
+          " sampler priority, so under --max_staleness > 0 the rollouts serve"
+          " the oldest in-flight batch first. Needs rollouts started with"
+          " --priority_scheduling; off, requests are served in arrival order."
+      ),
+  )
+  parser.add_argument(
+      "--initial_dispatch_stagger_s",
+      type=float,
+      default=0.0,
+      help=(
+          "Stagger the start-up prompt batches: each batch after batch 1 is"
+          " held this many seconds after the one before it (batch 1 waits"
+          " --initial_dispatch_first_stagger_s, which defaults to this value)."
+          " Applies only before the trainer consumes its first batch. 0"
+          " (default) dispatches the start-up batches as soon as the staleness"
+          " window allows."
+      ),
+  )
+  parser.add_argument(
+      "--initial_dispatch_first_stagger_s",
+      type=float,
+      default=None,
+      help=(
+          "Seconds batch 1 is held after batch 0 first dispatches; later"
+          " start-up batches follow every --initial_dispatch_stagger_s. Unset"
+          " (default) uses --initial_dispatch_stagger_s for batch 1 as well."
+      ),
+  )
+  parser.add_argument(
+      "--trainer_warmup_compile",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Compile the trainer before run_start (after the program configures"
+          " the trainer loss) against one synthetic micro-batch built through"
+          " the live batch assembler, instead of lazily on the first real"
+          " micro-batch inside the timed run."
+      ),
+  )
+  parser.add_argument(
+      "--trainer_warmup_routed_experts",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "The rollouts return routed experts (router replay), so the warm-up"
+          " micro-batch carries routed_experts too. Its [num_layers, top_k] is"
+          " read from the model config, else from the two flags below."
+      ),
+  )
+  parser.add_argument("--trainer_warmup_routed_layers", type=int, default=None)
+  parser.add_argument("--trainer_warmup_routed_top_k", type=int, default=None)
+  # ---- Optional GRPO algorithm options -------------------------------------
+  # All default to off, so omitting them reproduces the previous behaviour.
+  parser.add_argument(
+      "--epsilon_high",
+      type=float,
+      default=None,
+      help="Upper PPO clip bound, for DAPO-style asymmetric clipping.",
+  )
+  parser.add_argument(
+      "--loss_agg_mode",
+      type=str,
+      default="sequence-mean-token-mean",
+      help="Loss aggregation mode, e.g. token-mean or sequence-mean.",
+  )
+  parser.add_argument(
+      "--advantage_estimator",
+      type=str,
+      default="grpo",
+      help="Advantage estimator, e.g. grpo or grpo-loo (leave-one-out).",
+  )
+  parser.add_argument(
+      "--overlong_loss_masking",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Drop sequences truncated by the response budget from the loss AND"
+          " its denominator. Needs the rollout to report a trajectory status."
+      ),
+  )
+  parser.add_argument(
+      "--overlong_filter",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Filter out overlong trajectories from training. Sets"
+          " metadata['overlong_filter'] on prompt items."
+      ),
+  )
+  parser.add_argument(
+      "--seq_logprob_error_threshold",
+      type=float,
+      default=None,
+      help=(
+          "Drop sequences whose mean exp|log p_trainer - log q_sampler|"
+          " exceeds this. Requires rollout log-probabilities."
+      ),
+  )
+  parser.add_argument(
+      "--truncated_importance_sampling_type",
+      type=str,
+      default=None,
+      choices=(None, "seq-mask-tis"),
+      help="Set to seq-mask-tis to enable the sequence-mask TIS gate.",
+  )
+  parser.add_argument(
+      "--truncated_importance_sampling_ratio_min",
+      type=float,
+      default=None,
+      help="Lower edge of the TIS keep band.",
+  )
+  parser.add_argument(
+      "--truncated_importance_sampling_ratio",
+      type=float,
+      default=None,
+      help="Upper edge of the TIS keep band.",
+  )
+  parser.add_argument(
+      "--sampler_is_length_buckets",
+      type=_int_list,
+      default=None,
+      help=(
+          "Comma-separated completion-length bucket edges in tokens, e.g."
+          " 512,2048. Reports the sampler/trainer offset per bucket."
+      ),
+  )
+  parser.add_argument(
+      "--offpolicy",
+      "--max_staleness",
+      dest="max_staleness",
+      type=int,
+      default=os.getenv("MAX_STALENESS", 0),
+  )
+  parser.add_argument(
+      "--trajectory_group_order",
+      choices=("arrival", "prompt_batch"),
+      default=os.getenv("TRAJECTORY_GROUP_ORDER", "arrival"),
+      help=(
+          "Trajectory group order."
+      ),
+  )
+  parser.add_argument(
+      "--weight_sync_mode",
+      type=weight_sync.WeightSyncMode,
+      default=weight_sync.WeightSyncMode(os.getenv("WEIGHT_SYNC_MODE", "none")),
+      choices=list(weight_sync.WeightSyncMode),
+  )
+  parser.add_argument(
+      "--disable_weight_sync_timeouts",
+      action=argparse.BooleanOptionalAction,
+      default=weight_sync_coordinator.is_weight_sync_timeouts_disabled(),
+      help=(
+          "Disable all weight-sync phase and RPC timeouts (sets them to"
+          " infinity). Also controlled via WEIGHT_SYNC_DISABLE_TIMEOUTS=1."
+      ),
+  )
+  parser.add_argument(
+      "--trainable_parameters_mask",
+      type=str,
+      default=None,
+      help="Trainable parameters regex mask for freezing weights.",
+  )
+  parser.add_argument("--dataset_path", type=str, default="")
+  parser.add_argument(
+      "--dataset_name", type=str, default=DEFAULT_DATASET_NAME
+  )
+  parser.add_argument("--dataset_split", type=str, default="train")
+  parser.add_argument(
+      "--dataset_cache_dir",
+      type=str,
+      default=os.getenv("DATASET_CACHE_DIR", ""),
+  )
+  parser.add_argument("--seed", type=int, default=42)
+  parser.add_argument(
+      "--shuffle", action=argparse.BooleanOptionalAction, default=True
+  )
+  parser.add_argument(
+      "--max_turns", type=int, default=int(os.getenv("MAX_TURNS", "30"))
+  )
+  parser.add_argument(
+      "--step_timeout_secs",
+      type=int,
+      default=int(os.getenv("STEP_TIMEOUT_SECS", "60")),
+  )
+  parser.add_argument(
+      "--reward_timeout_secs",
+      type=int,
+      default=int(os.getenv("REWARD_TIMEOUT_SECS", "60")),
+  )
+  parser.add_argument(
+      "--episode_timeout_secs",
+      type=int,
+      default=int(os.getenv("EPISODE_TIMEOUT_SECS", "1800")),
+      help="Maximum episode duration in seconds before timeout termination.",
+  )
+  parser.add_argument("--env_backend", type=str, default="kubernetes")
+  parser.add_argument(
+      "--scaffold",
+      choices=("r2egym", "sweagent", "openhands"),
+      default="r2egym",
+  )
+  parser.add_argument("--use_agent_sandbox", action="store_true")
+  parser.add_argument(
+      "--max_warmpool_replicas",
+      type=int,
+      default=None,
+      help=(
+          "Maximum replicas per SandboxWarmPool (defaults to num_generations)."
+      ),
+  )
+  parser.add_argument(
+      "--sandbox_wait_initial",
+      action=argparse.BooleanOptionalAction,
+      default=os.getenv("SANDBOX_WAIT_INITIAL", "true").lower()
+      in ("1", "true", "yes"),
+      help=(
+          "Whether PrewarmDatasetIterator waits synchronously for the initial"
+          " warmpool batch before yielding the first prompt."
+      ),
+  )
+  parser.add_argument(
+      "--prepull_sandbox_images",
+      action=argparse.BooleanOptionalAction,
+      default=os.getenv("PREPULL_SANDBOX_IMAGES", "false").lower()
+      in ("1", "true", "yes"),
+      help=(
+          "Pre-pull all static dataset task images onto sandbox nodes with"
+          " imagePullPolicy=IfNotPresent and run sync && sysctl"
+          " vm.drop_caches=3 before init_start / run_start."
+      ),
+  )
+  parser.add_argument(
+      "--prepull_images_file",
+      type=str,
+      default=os.getenv("PREPULL_IMAGES_FILE", ""),
+      help=(
+          "Path (local or gs://) to a static manifest file containing container"
+          " image URIs to pre-pull before init_start without touching the"
+          " dataset."
+      ),
+  )
+  parser.add_argument(
+      "--prewarm_images_file",
+      type=str,
+      default=os.getenv("PREWARM_IMAGES_FILE", ""),
+      help=(
+          "Path (local or gs://) to a static manifest file (e.g. sandboxes.txt)"
+          " containing container image URIs to pre-warm on Kubernetes directly"
+          " instead of dynamically discovering images by inspecting the dataset."
+      ),
+  )
+  parser.add_argument(
+      "--prewarm_max_workers",
+      type=int,
+      default=int(os.getenv("PREWARM_MAX_WORKERS", "32")),
+      help="Maximum concurrent worker threads for pre-warming sandbox pools on Kubernetes.",
+  )
+  parser.add_argument(
+      "--max_concurrency",
+      type=int,
+      default=128,
+      help="Maximum concurrency for SandboxFleet.",
+  )
+  parser.add_argument(
+      "--image_rewrite_prefix",
+      type=str,
+      default=os.getenv("IMAGE_REWRITE_PREFIX", ""),
+      help=(
+          "Container registry prefix to rewrite problem docker images for image"
+          " streaming."
+      ),
+  )
+  parser.add_argument("--env_verbose", action="store_true")
+  parser.add_argument(
+      "--flush_every_n_steps",
+      type=int,
+      default=1,
+      help="Frequency in steps to flush metrics logger.",
+  )
+  parser.add_argument(
+      "--log_dir",
+      type=str,
+      default=os.getenv("LOG_DIR", "/tmp/trellis_deepswe"),
+      help="Directory for local event logging (TensorBoard/CLU).",
+  )
+  parser.add_argument(
+      "--trajectory_log_dir",
+      type=str,
+      default=os.getenv("TRAJECTORY_LOG_DIR", None),
+      help=(
+          "Directory for trajectory logging. Defaults to "
+          "<log_dir>/trajectories when log_dir is set."
+      ),
+  )
+  parser.add_argument(
+      "--wandb_project",
+      type=str,
+      default=os.getenv("WANDB_PROJECT", "trellis-deepswe"),
+      help="W&B project name.",
+  )
+  parser.add_argument(
+      "--wandb_run_name",
+      type=str,
+      default=os.getenv("WANDB_RUN_NAME", ""),
+      help="W&B run name. Defaults to timestamp-based name if unset.",
+  )
+  parser.add_argument("--rpc_timeout_s", type=float, default=1800.0)
+  parser.add_argument("--init_timeout_s", type=float, default=None)
+  parser.add_argument("--inference_addr", type=str, default="")
+  parser.add_argument(
+      "--stop_workers_on_exit",
+      action="store_true",
+      help=(
+          "Send a graceful gRPC stop to every remote worker when the"
+          " orchestrator exits (drains in-flight checkpoint saves)."
+      ),
+  )
+  parser.add_argument(
+      "--debug",
+      action="store_true",
+      help="Enable debug logging and print full sampler responses.",
+  )
+  parser.add_argument(
+      "--rcp_logging",
+      action="store_true",
+      default=False,
+      help="Enable MLPerf RCP (mllog) compliance logging.",
+  )
+  parser.add_argument(
+      "--val_start_at",
+      type=int,
+      default=(
+          int(os.getenv("VAL_START_AT"))
+          if os.getenv("VAL_START_AT", "").strip()
+          else None
+      ),
+      help=(
+          "First optimizer step to save/evaluate checkpoints from "
+          "(defaults to CEIL(2.5 + 3840 / global_batch_size))."
+      ),
+  )
+  parser.add_argument(
+      "--metric_logger_dir",
+      type=str,
+      default=os.getenv("METRIC_LOGGER_DIR", None),
+      help="Directory or GCS URI for MLPerf RCP output (seed_<seed>.out).",
+  )
+  parser.add_argument(
+      "--target_accuracy",
+      type=float,
+      default=float(os.getenv("TARGET_ACCURACY", "0.69")),
+      help="Target evaluation accuracy for MLPerf RCP compliance logging.",
+  )
+  parser.add_argument(
+      "--eval_every_n_steps",
+      type=int,
+      default=int(os.getenv("EVAL_EVERY_N_STEPS", "1000000")),
+  )
+  parser.add_argument(
+      "--learning_rate",
+      type=float,
+      default=float(os.getenv("LEARNING_RATE", "1.0e-6")),
+  )
+  parser.add_argument(
+      "--b1",
+      type=float,
+      default=float(os.getenv("ADAM_B1", "0.9")),
+  )
+  parser.add_argument(
+      "--b2",
+      type=float,
+      default=float(os.getenv("ADAM_B2", "0.999")),
+  )
+  parser.add_argument(
+      "--weight_decay",
+      type=float,
+      default=float(os.getenv("WEIGHT_DECAY", "0.01")),
+  )
+  parser.add_argument(
+      "--max_grad_norm",
+      type=float,
+      default=float(os.getenv("MAX_GRAD_NORM", "1.0")),
+  )
+  parser.add_argument(
+      "--train_mesh_tp",
+      type=int,
+      default=int(os.getenv("TRAINER_MESH_TP", "1")),
+  )
+  parser.add_argument(
+      "--train_mesh_context",
+      "--train_mesh_sp",
+      dest="train_mesh_context",
+      type=int,
+      default=int(os.getenv("TRAINER_MESH_CONTEXT", "1")),
+  )
+  parser.add_argument(
+      "--train_mesh_expert",
+      type=int,
+      default=int(os.getenv("TRAINER_MESH_EXPERT", "1")),
+  )
+  parser.add_argument(
+      "--rollout_mesh_tp",
+      type=int,
+      default=int(os.getenv("ROLLOUT_MESH_TP", "1")),
+  )
+  parser.add_argument(
+      "--rollout_mesh_expert",
+      type=int,
+      default=int(os.getenv("ROLLOUT_MESH_EXPERT", "1")),
+  )
+  parser.add_argument(
+      "--rollout_engine",
+      type=str,
+      default=os.getenv("SAMPLER", "vllm"),
+  )
+  parser.add_argument(
+      "--tpu_topology",
+      type=str,
+      default=os.getenv("TPU_TOPOLOGY", None),
+  )
+  parser.add_argument(
+      "--trajectory_store_root_dir",
+      "--trajectory_store_root",
+      dest="trajectory_store_root_dir",
+      type=str,
+      default=os.getenv(
+          "TRAJECTORY_STORE_ROOT_DIR",
+          os.getenv("TRAJECTORY_STORE_ROOT", ""),
+      ),
+      help="Root directory for the file-backed TrajectoryStore.",
+  )
+  parser.add_argument(
+      "--trajectory_store_db_url",
+      type=str,
+      default=os.getenv("TRAJECTORY_STORE_DB_URL", ""),
+      help=(
+          "SQLAlchemy database URL for the SQL-backed TrajectoryStore (e.g."
+          " 'sqlite:////path/to/store.db' or"
+          " 'postgresql+psycopg2://user:pass@host:5432/dbname')."
+      ),
+  )
+  return parser.parse_args(argv)
+
+
+def _build_trajectory_store_config(
+    args: argparse.Namespace,
+) -> list[dict[str, Any] | None] | None:
+  """Builds the [file_store, sql_store] TrajectoryStore configuration list."""
+  root_dir = (args.trajectory_store_root_dir or "").strip()
+  db_url = (args.trajectory_store_db_url or "").strip()
+  file_cfg = (
+      {"enabled": True, "backend": "file", "root_dir": root_dir}
+      if root_dir
+      else None
+  )
+  sql_cfg = (
+      {"enabled": True, "backend": "sql", "db_url": db_url}
+      if db_url
+      else None
+  )
+  if file_cfg is None and sql_cfg is None:
+    return None
+  return [file_cfg, sql_cfg]
+
+
+def _build_algo(args: argparse.Namespace) -> algorithm_adapter.GRPOAdapter:
+  algo_config = algorithm_config.GRPOConfig(
+      num_generations=args.num_generations,
+      epsilon=args.epsilon,
+      epsilon_high=args.epsilon_high,
+      beta=args.beta,
+      temperature=args.temperature,
+      use_rollout_logps=args.use_rollout_logps,
+      exact_token_continuity=args.exact_token_continuity,
+      loss_agg_mode=args.loss_agg_mode,
+      advantage_estimator=args.advantage_estimator,
+      overlong_loss_masking=args.overlong_loss_masking,
+      seq_logprob_error_threshold=args.seq_logprob_error_threshold,
+      truncated_importance_sampling_type=(
+          args.truncated_importance_sampling_type
+      ),
+      truncated_importance_sampling_ratio_min=(
+          args.truncated_importance_sampling_ratio_min
+      ),
+      truncated_importance_sampling_ratio=(
+          args.truncated_importance_sampling_ratio
+      ),
+      sampler_is_length_buckets=args.sampler_is_length_buckets,
+  )
+  return algorithm_adapter.GRPOAdapter(
+      algo_config=algo_config,
+      mini_batch_size=args.mini_batch_size,
+      train_micro_batch_size=args.train_micro_batch_size,
+      max_turns=args.max_turns,
+      max_packed_len=(
+          args.max_seq_token_per_tpu
+          if args.max_seq_token_per_tpu is not None
+          else args.max_prompt_length + args.max_response_length
+      ),
+      max_response_length=args.max_response_length,
+  )
+
+
+def _configure_trainer_loss(
+    trainer_handle: remote_execution.ActorHandle,
+    *,
+    algo: algorithm_adapter.GRPOAdapter,
+    pad_id: int,
+    eos_id: int,
+) -> None:
+  logging.info(
+      "Configuring trainer-side GRPO loss via TrainerWorker RPC (beta=%s, "
+      "epsilon=%s).",
+      algo.algo_config.beta,
+      algo.algo_config.epsilon,
+  )
+  trainer_handle.submit("with_loss_fn", algo.loss_fn(), has_aux=True)
+  trainer_handle.submit(
+      "with_gen_model_input_fn",
+      algo.build_gen_model_input_fn(pad_id=pad_id, eos_id=eos_id),
+  )
+
+
+def _register_signal_handlers(
+    on_exit_signal: Callable[[int], None] | None = None,
+) -> None:
+  """Registers SIGTERM and SIGINT handlers so Python unwinds cleanly via SystemExit."""
+
+  def _handle_exit_signal(signum, frame):
+    del frame
+    logging.info(
+        "Received signal %d in orchestrator; shutting down cleanly...", signum
+    )
+    if on_exit_signal is not None:
+      try:
+        on_exit_signal(signum)
+      except Exception:  # pylint: disable=broad-exception-caught
+        logging.exception("Error in exit signal callback")
+    sys.exit(128 + signum)
+
+  for sig in (signal.SIGTERM, signal.SIGINT):
+    try:
+      signal.signal(sig, _handle_exit_signal)
+    except (ValueError, OSError):
+      pass
+
+
+def main(argv: list[str], context: ProcessContext | None = None) -> None:
+  assert (
+      context and context.ipc and context.ipc.discovery
+  ), "Require discovery API, but process context doesn't support."
+
+  args = _parse_args(argv)
+  logging.basicConfig(
+      level=logging.DEBUG if args.debug else logging.INFO,
+      format="%(asctime)s - [DeepSWEOrchestrator] %(message)s",
+      force=True,
+  )
+  program = None
+
+  def _finish_training(status: str) -> None:
+    if not args.rcp_logging:
+      return
+    last = program.last_step_result if program is not None else None
+    mllog_utils.finish_training(
+        args,
+        status=status,
+        completed_steps=last.step + 1 if last is not None else None,
+        last_step_time_ms=(
+            program.last_step_timestamp_ms if program is not None else None
+        ),
+    )
+
+  _register_signal_handlers(
+      on_exit_signal=lambda _sig: _finish_training("aborted")
+  )
+
+  if args.mini_batch_size is None:
+    args.mini_batch_size = args.batch_size
+  if args.num_generations <= 1:
+    raise ValueError("num_generations must be greater than 1 for GRPO.")
+  if args.batch_size <= 0:
+    raise ValueError("batch_size must be positive.")
+  if args.max_staleness < 0:
+    raise ValueError("offpolicy/max_staleness must be non-negative.")
+
+  if args.image_rewrite_prefix:
+    os.environ["IMAGE_REWRITE_PREFIX"] = args.image_rewrite_prefix.strip('"\'')
+  if args.disable_weight_sync_timeouts:
+    os.environ["WEIGHT_SYNC_DISABLE_TIMEOUTS"] = "1"
+
+  logging.info("=== Starting Distributed DeepSWE GRPO Orchestrator ===")
+  logging.info(
+      "Configuration: model_id=%s, batch_size=%d prompt group(s), "
+      "mini_batch_size=%d, num_generations=%d, max_steps=%d, max_turns=%d, "
+      "train_micro=%d, beta=%.4f, env_backend=%s, use_agent_sandbox=%s, "
+      "weight_sync_mode=%s, disable_weight_sync_timeouts=%s, "
+      "trainable_parameters_mask=%s, image_rewrite_prefix=%s.",
+      args.model_id,
+      args.batch_size,
+      args.mini_batch_size,
+      args.num_generations,
+      args.max_steps,
+      args.max_turns,
+      args.train_micro_batch_size,
+      args.beta,
+      args.env_backend,
+      args.use_agent_sandbox,
+      args.weight_sync_mode,
+      args.disable_weight_sync_timeouts,
+      args.trainable_parameters_mask,
+      args.image_rewrite_prefix or "(none)",
+  )
+  logging.info("Control-plane JAX backend: %s", jax.default_backend())
+
+  cluster = orchestrator.ClusterOrchestrator(
+      weight_sync_mode=args.weight_sync_mode,
+      trajectory_store_config=_build_trajectory_store_config(args),
+      disable_weight_sync_timeouts=args.disable_weight_sync_timeouts,
+      jax_cache_config={
+          "save_jax_cache": os.getenv("SAVE_JAX_CACHE", "true").lower() in ("1", "true", "yes"),
+          "jax_cache_gcs_dir": os.getenv("JAX_CACHE_GCS_DIR"),
+          "rollout_jax_cache_gcs_dir": os.getenv("ROLLOUT_JAX_CACHE_GCS_DIR"),
+      },
+      fault_tolerance_config=datatypes.RolloutFaultToleranceConfig(
+          enabled=args.rollout_fault_tolerance,
+          max_task_retries=args.rollout_max_task_retries,
+          max_in_flight_per_worker=args.max_concurrent_rollouts_per_worker,
+          task_timeout_s=args.rollout_task_timeout_s,
+          max_zero_worker_wait_s=args.max_zero_worker_wait_s,
+          recover_unknown_transfer_state=args.recover_unknown_transfer_state,
+      ),
+  )
+  context.ipc.discovery.on_register(
+      functools.partial(
+          cluster.register_worker_from_hostname,
+          rpc_timeout_s=args.rpc_timeout_s,
+      )
+  )
+
+  # --- TUNIX-DEEPSWE observability patch (console-only; no algorithm change) ---
+  import collections as _collections  # pylint: disable=g-import-not-at-top
+  import time as _time  # pylint: disable=g-import-not-at-top
+
+  def _console_metric(name, value, **kw):
+    try:
+      logging.info("METRIC step=%s %s=%s", kw.get("step"), name, float(value))
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.info("METRIC step=%s %s=%r", kw.get("step"), name, value)
+
+  jax.monitoring.register_scalar_listener(_console_metric)
+
+  def _membership_listener(worker_id, state):
+    logging.info(
+        "MEMBERSHIP t=%.3f worker_id=%s state=%s",
+        _time.time(),
+        worker_id,
+        getattr(state, "value", state),
+    )
+
+  cluster.registry.add_state_listener(_membership_listener)
+
+  # --- TUNIX-CONTROLLER exporter (in-process HTTP :TUNIX_EXPORTER_PORT, /metrics /status; read-only) ---
+  from tunix.experimental.examples.deepswe_dist import tunix_exporter as _tunix_exporter  # pylint: disable=g-import-not-at-top
+  _exporter = _tunix_exporter.Exporter(
+      cluster,
+      port=int(os.getenv("TUNIX_EXPORTER_PORT", "8787")),
+      run_name=os.getenv("TUNIX_RUN_NAME", ""),
+  )
+  jax.monitoring.register_scalar_listener(_exporter.on_scalar)
+  cluster.registry.add_state_listener(_exporter.on_membership)
+  _exporter.serve()
+  # --- end exporter ---
+
+  _k8s = {}
+
+  def _sandbox_snapshot():
+    try:
+      if "core" not in _k8s:
+        from kubernetes import client as _kc  # pylint: disable=g-import-not-at-top
+        from kubernetes import config as _kcfg  # pylint: disable=g-import-not-at-top
+
+        _kcfg.load_incluster_config()
+        _k8s["core"] = _kc.CoreV1Api()
+        _k8s["custom"] = _kc.CustomObjectsApi()
+        _k8s["ns"] = (
+            os.getenv("SANDBOX_NAMESPACE") or os.getenv("NAMESPACE") or "default"
+        )
+      ns = _k8s["ns"]
+      pods = _k8s["core"].list_namespaced_pod(ns, label_selector="app=agent-sandbox-rl").items
+      phases = _collections.Counter(p.status.phase for p in pods)
+      ready = sum(
+          1
+          for p in pods
+          if p.status.phase == "Running"
+          and all(cs.ready for cs in (p.status.container_statuses or []))
+      )
+      pools = _k8s["custom"].list_namespaced_custom_object(
+          "extensions.agents.x-k8s.io", "v1beta1", ns, "sandboxwarmpools"
+      ).get("items", [])
+      pool_replicas = sum(int((p.get("spec") or {}).get("replicas") or 0) for p in pools)
+      pool_available = sum(
+          int((p.get("status") or {}).get("availableReplicas") or 0) for p in pools
+      )
+      claims = _k8s["custom"].list_namespaced_custom_object(
+          "extensions.agents.x-k8s.io", "v1beta1", ns, "sandboxclaims"
+      ).get("items", [])
+      return (
+          f"pods_total={len(pods)} pods={dict(phases)} pods_ready={ready}"
+          f" warmpools={len(pools)} pool_replicas={pool_replicas}"
+          f" pool_available={pool_available} claims={len(claims)}"
+      )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      return f"sandbox_snapshot_error={e!r}"[:300]
+
+  def _ft_snapshot(step):
+    try:
+      eng = cluster.engine
+      states = {
+          wid: cluster.registry.state(wid).value
+          for wid in cluster.registry.worker_ids(include_evicted=True)
+      }
+      n_active = len(getattr(eng, "_rollout_workers", []) or []) if eng else -1
+      ftm = eng.fault_tolerance_metrics if eng else {}
+      logging.info(
+          "FTSNAP step=%s t=%.3f active_rollout_workers=%d states=%s ft=%s",
+          step,
+          _time.time(),
+          n_active,
+          states,
+          ftm,
+      )
+      logging.info("SANDBOXSNAP step=%s t=%.3f %s", step, _time.time(), _sandbox_snapshot())
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logging.info("FTSNAP step=%s error=%r", step, e)
+  # --- end patch ---
+
+  prepull_future = None
+  prepull_executor = None
+  if args.use_agent_sandbox and args.prepull_sandbox_images:
+    from concurrent import futures  # pylint: disable=g-import-not-at-top
+    from tunix.experimental.examples.deepswe_dist import prepull_sandbox_images  # pylint: disable=g-import-not-at-top
+
+    logging.info(
+        "Starting sandbox container image pre-pulling (before MLPerf"
+        " init_start)..."
+    )
+    prepull_executor = futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="sandbox-prepull"
+    )
+    if args.prepull_images_file:
+      prepull_future = prepull_executor.submit(
+          prepull_sandbox_images.prepull_from_manifest,
+          manifest_path=args.prepull_images_file,
+          scaffold=args.scaffold,
+      )
+    else:
+      prepull_future = prepull_executor.submit(
+          prepull_sandbox_images.prepull_from_dataset,
+          dataset_name=args.dataset_name,
+          dataset_split=args.dataset_split,
+          dataset_path=args.dataset_path,
+          cache_dir=args.dataset_cache_dir or None,
+          scaffold=args.scaffold,
+      )
+  try:
+    logging.info(
+        "Waiting for workers to register (before MLPerf init_start)..."
+    )
+    cluster.wait_for_workers(
+        min_workers={
+            datatypes.Role.ACTOR: 1,
+            datatypes.Role.ROLLOUT: args.rollout_replicas,
+            datatypes.Role.REFERENCE: 1 if args.beta != 0.0 else 0,
+        },
+        timeout=args.init_timeout_s,
+        poll_interval_s=1.0,
+    )
+    logging.info("Registered workers: %s", cluster.worker_infos())
+    if prepull_future is not None:
+      logging.info(
+          "Waiting for sandbox container image pre-pulling to finish before"
+          " MLPerf init_start..."
+      )
+      try:
+        num_staged = prepull_future.result()
+        logging.info(
+            "Finished pre-pulling %d static sandbox images (and dropped OS"
+            " caches) before MLPerf init_start.",
+            num_staged,
+        )
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning(
+            "[Prepull] Sandbox image pre-pulling encountered an error: %s."
+            " Proceeding with training using on-demand GKE Image Streaming.",
+            e,
+        )
+  finally:
+    if prepull_executor is not None:
+      prepull_executor.shutdown(wait=False)
+
+  if args.rcp_logging:
+    mllog_utils.init_start(args)
+
+  tokenizer_path = (
+      args.tokenizer_path or os.getenv("MODEL_DIR") or args.model_id
+  )
+  tokenizer = AutoTokenizer.from_pretrained(
+      tokenizer_path, trust_remote_code=True
+  )
+  if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+    tokenizer.pad_token = tokenizer.eos_token
+  pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+  eos_id = (
+      tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+  )
+  logging.info(
+      "Loaded tokenizer from %s (vocab_size=%d, pad_id=%d, eos_id=%d).",
+      tokenizer_path,
+      len(tokenizer),
+      pad_id,
+      eos_id,
+  )
+
+  from examples.deepswe import sandbox_utils  # pylint: disable=g-import-not-at-top
+  from examples.deepswe import swe_env  # pylint: disable=g-import-not-at-top
+  from tunix.experimental.examples.deepswe_dist import deepswe  # pylint: disable=g-import-not-at-top
+
+  algo = _build_algo(args)
+  trainer_handles = cluster.worker_handles(datatypes.Role.ACTOR)
+  if len(trainer_handles) != 1:
+    raise ValueError(f"Expected 1 trainer worker, got {len(trainer_handles)}.")
+  _configure_trainer_loss(
+      trainer_handles[0],
+      algo=algo,
+      pad_id=pad_id,
+      eos_id=eos_id,
+  )
+
+  metrics_logging_options = metrics_logger_lib.MetricsLoggerOptions(
+      log_dir=args.log_dir,
+      project_name=args.wandb_project,
+      run_name=args.wandb_run_name,
+      flush_every_n_steps=args.flush_every_n_steps,
+      backend_kwargs={"wandb": {"config": vars(args)}},
+  )
+
+  fleet = None
+  prompt_stream = None
+  program = None
+  prewarm_thread = None
+  effective_num_generations_to_dispatch = (
+      args.num_generations_to_dispatch
+      if args.num_generations_to_dispatch is not None
+      else args.num_generations
+  )
+
+  prewarm_manifest = (
+      args.prewarm_images_file
+      or os.getenv("PREWARM_IMAGES_FILE")
+      or ""
+  )
+  if args.use_agent_sandbox and prewarm_manifest:
+    logging.info(
+        "[Init] Initializing SandboxFleet and pre-warming sandboxes from"
+        " manifest '%s' before train_start...",
+        prewarm_manifest,
+    )
+    fleet = sandbox_utils.init_global_fleet(
+        tasks=None,
+        images_file=prewarm_manifest,
+        max_concurrency=args.max_concurrency,
+        num_generations=effective_num_generations_to_dispatch,
+        batch_size=args.batch_size,
+        max_warmpool_replicas=args.max_warmpool_replicas,
+        scaffold=args.scaffold,
+    )
+    prewarm_thread = sandbox_utils.prewarm_manifest_sandboxes(
+        manifest_path=prewarm_manifest,
+        fleet=fleet,
+        scaffold=args.scaffold,
+        max_warmpool_replicas=args.max_warmpool_replicas,
+        num_generations=effective_num_generations_to_dispatch,
+        wait=args.sandbox_wait_initial,
+        async_warm=True,
+        max_workers=args.prewarm_max_workers,
+    )
+
+  try:
+    global_batch_size = int(args.batch_size) * int(args.num_generations)
+    val_start_step = (
+        mllog_utils.compute_val_start_step(global_batch_size, args.val_start_at)
+        if args.rcp_logging or args.val_start_at is not None
+        else None
+    )
+    manifest_file = (
+        os.path.join(
+            args.metric_logger_dir.rstrip("/"), "eval_checkpoints.jsonl"
+        )
+        if args.rcp_logging and args.metric_logger_dir
+        else ""
+    )
+
+    def _on_checkpoint_saved(ckpt_info: dict[str, Any]) -> None:
+      if not manifest_file:
+        return
+      step_num = int(ckpt_info["step"])
+      samples_count = step_num * global_batch_size
+      ts_ms = int(ckpt_info["timestamp_ms"])
+      ckpt_path = str(ckpt_info["checkpoint_path"])
+      if not ckpt_path:
+        raise ValueError(
+            f"save_checkpoint for step {step_num} returned no checkpoint_path;"
+            " cannot write the eval manifest entry."
+        )
+      record = {
+          "step": step_num,
+          "checkpoint_path": ckpt_path,
+          "timestamp_ms": ts_ms,
+          "samples_count": samples_count,
+          "global_batch_size": global_batch_size,
+          "batch_size": int(args.batch_size),
+          "num_generations": int(args.num_generations),
+          "val_start_at": int(val_start_step or 1),
+          "max_steps": int(args.max_steps),
+          "target_accuracy": float(args.target_accuracy),
+          "seed": int(args.seed),
+          "mllog_file": (
+              mllog_utils.get_mllog_file_path(
+                  metric_logger_dir=args.metric_logger_dir, seed=args.seed
+              )
+              or ""
+          ),
+      }
+      mllog_utils.append_checkpoint_manifest(manifest_file, record)
+      logging.info(
+          "Appended checkpoint manifest entry for step=%d to %s",
+          step_num,
+          manifest_file,
+      )
+
+    def _on_train_start(step: int) -> None:
+      nonlocal fleet, prompt_stream, prewarm_thread
+      if prewarm_thread is not None:
+        logging.info(
+            "[Init] Waiting for manifest sandbox pre-warming to complete before"
+            " train_start..."
+        )
+        if hasattr(prewarm_thread, "join_and_check"):
+          prewarm_thread.join_and_check()
+        else:
+          prewarm_thread.join()
+        prewarm_thread = None
+
+      if args.rcp_logging:
+        mllog_utils.train_start(args, step=step)
+
+      logging.info(
+          "Loading DeepSWE dataset after train_start: source=%s split=%s.",
+          args.dataset_path or args.dataset_name,
+          args.dataset_split,
+      )
+      dataset = deepswe.load_deepswe_dataset(
+          dataset_name=args.dataset_name,
+          dataset_split=args.dataset_split,
+          dataset_path=args.dataset_path,
+          cache_dir=args.dataset_cache_dir or None,
+          shuffle=args.shuffle,
+          seed=args.seed,
+      )
+      logging.info(
+          "Loaded DeepSWE dataset: source=%s split=%s size=%d.",
+          args.dataset_path or args.dataset_name,
+          args.dataset_split,
+          len(dataset),
+      )
+
+      if args.use_agent_sandbox:
+        if fleet is None:
+          fleet = sandbox_utils.init_global_fleet(
+              tasks=dataset,
+              max_concurrency=args.max_concurrency,
+              num_generations=effective_num_generations_to_dispatch,
+              batch_size=args.batch_size,
+              max_warmpool_replicas=args.max_warmpool_replicas,
+              scaffold=args.scaffold,
+          )
+        else:
+          sandbox_utils.ensure_tasks_in_fleet_plan(
+              fleet, list(dataset), scaffold=args.scaffold
+          )
+
+      raw_prompt_stream = deepswe.iter_prompt_items(
+          dataset=dataset,
+          max_steps=args.max_steps,
+          batch_size=args.batch_size,
+          max_turns=args.max_turns,
+          max_response_length=args.max_response_length,
+          temperature=args.temperature,
+          top_p=args.top_p,
+          top_k=None if args.top_k < 0 else args.top_k,
+          step_timeout_secs=args.step_timeout_secs,
+          reward_timeout_secs=args.reward_timeout_secs,
+          env_backend=args.env_backend,
+          use_agent_sandbox=args.use_agent_sandbox,
+          scaffold=args.scaffold,
+          env_verbose=args.env_verbose,
+          episode_timeout_secs=args.episode_timeout_secs,
+          overlong_filter=args.overlong_filter,
+          exact_token_continuity=args.exact_token_continuity,
+          max_staleness=args.max_staleness,
+      )
+      if args.use_agent_sandbox:
+        prompt_stream = swe_env.PrewarmDatasetIterator(
+            raw_prompt_stream,
+            fleet=fleet,
+            num_generations=effective_num_generations_to_dispatch,
+            batch_size=args.batch_size,
+            max_warmpool_replicas=args.max_warmpool_replicas,
+            unwarm_on_exhaustion=True,
+            scaffold=args.scaffold,
+            wait_initial=False if prewarm_manifest else args.sandbox_wait_initial,
+            max_staleness=args.max_staleness,
+            max_workers=args.prewarm_max_workers,
+            images_file=prewarm_manifest or None,
+        )
+      else:
+        prompt_stream = raw_prompt_stream
+      program.dataset = prompt_stream
+
+    program = rl_program.StandardRLProgram(
+        algo=algo,
+        dataset=None,
+        max_steps=args.max_steps,
+        generation_args=datatypes.GenerationArgs(
+            max_generation_steps=args.max_response_length,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=None if args.top_k < 0 else args.top_k,
+            return_logprobs=True,
+        ),
+        reward_fns=[],
+        batch_size=args.batch_size,
+        batch_config=batch_assembly.BatchConfig(
+            pad_id=pad_id,
+            max_prompt_length=args.max_prompt_length,
+            max_response_length=args.max_response_length,
+            max_seq_token_per_tpu=args.max_seq_token_per_tpu,
+            max_segments_per_packed_row=args.max_segments_per_packed_row,
+            trainer_fsdp=args.trainer_fsdp,
+            trainer_dp=args.trainer_dp,
+            trainer_expert=args.trainer_expert,
+        ),
+        metrics_logging_options=metrics_logging_options,
+        trajectory_log_dir=args.trajectory_log_dir,
+        trajectory_store=cluster.trajectory_store,
+        max_staleness=args.max_staleness,
+        num_generations_to_dispatch=args.num_generations_to_dispatch,
+        prefer_valid_rollouts=args.prefer_valid_rollouts,
+        group_order=args.trajectory_group_order,
+        sync_weights=(args.weight_sync_mode != weight_sync.WeightSyncMode.NONE),
+        checkpoint_optimizer_interval_steps=(
+            args.checkpoint_optimizer_interval_steps
+        ),
+        async_weight_sync=args.async_weight_sync,
+        pipeline_train_microbatches=args.pipeline_train_microbatches,
+        partial_rollout=args.in_flight_weight_updates,
+        rollout_priority_scheduling=args.rollout_priority_scheduling,
+        initial_dispatch_stagger_s=args.initial_dispatch_stagger_s,
+        initial_dispatch_first_stagger_s=args.initial_dispatch_first_stagger_s,
+        on_train_start=_on_train_start,
+        on_step_begin=lambda step: (
+            logging.info(
+                ">>> DeepSWE step %d starting | policy_version=%d | t=%.3f",
+                step,
+                step,
+                _time.time(),
+            ),
+            _ft_snapshot(step),
+            _exporter.on_step_begin(step),
+        ),
+        on_step_end=lambda step, result: (
+            logging.info(
+                "<<< DeepSWE step %d finished | train_result=%s | t=%.3f",
+                step,
+                result,
+                _time.time(),
+            ),
+            _ft_snapshot(step),
+            _exporter.on_step_end(step),
+            mllog_utils.log_rcp_step_stats(
+                program.metrics_logger,
+                args=args,
+                step=step + 1,
+            )
+            if args.rcp_logging
+            else None,
+        ),
+        val_start_step=val_start_step,
+        on_checkpoint_saved=_on_checkpoint_saved if manifest_file else None,
+    )
+
+    if args.rcp_logging:
+      mllog_utils.init_print(
+          args,
+          train_dataset=None,
+      )
+
+    logging.info("Bringing up remote workers through ClusterOrchestrator...")
+    if args.trainer_warmup_compile:
+      # Compiled by the program after `configure_worker` and before
+      # `on_train_start` (run_start): `configure_worker` re-sends the loss and
+      # input fn, which discards any compile done at bring-up.
+      routed_shape = None
+      if args.trainer_warmup_routed_experts:
+        routed_shape = trainer_warmup.routed_experts_shape_from_config(
+            tokenizer_path
+        )
+        if routed_shape is not None:
+          logging.info(
+              "TRAINER_WARMUP_COMPILE: routed_experts [num_layers, top_k]=%s"
+              " from the model config at %s.",
+              routed_shape,
+              tokenizer_path,
+          )
+        elif (
+            args.trainer_warmup_routed_layers
+            and args.trainer_warmup_routed_top_k
+        ):
+          routed_shape = (
+              args.trainer_warmup_routed_layers,
+              args.trainer_warmup_routed_top_k,
+          )
+          logging.warning(
+              "TRAINER_WARMUP_COMPILE: model config unavailable; routed_experts"
+              " [num_layers, top_k]=%s from --trainer_warmup_routed_layers /"
+              " --trainer_warmup_routed_top_k.",
+              routed_shape,
+          )
+        else:
+          logging.warning(
+              "TRAINER_WARMUP_COMPILE: router replay is on but [num_layers,"
+              " top_k] is unknown; the warm-up omits routed_experts and the"
+              " first real micro-batch will recompile."
+          )
+      program.trainer_warmup_payload = trainer_warmup.build_warmup_payload(
+          algo=algo,
+          batch_config=program.batch_config,
+          num_generations=program.num_generations,
+          mini_batch_size=program.mini_batch_size,
+          train_micro_batch_size=algo.train_micro_batch_size,
+          routed_experts_shape=routed_shape,
+      )
+      logging.info(
+          "TRAINER_WARMUP_COMPILE: built synthetic micro-batch: %s",
+          batch_assembly.describe_payload(program.trainer_warmup_payload),
+      )
+    cluster.bring_up_workers(dummy_data=None)
+    logging.info("Starting DeepSWE StandardRLProgram execution...")
+    cluster.run(
+        program=program,
+        num_steps=args.max_steps,
+        bring_up=False,
+    )
+    _finish_training("success")
+  except BaseException as e:
+    _finish_training("aborted")
+    logging.exception("FATAL ERROR in orchestrator execution: %s", e)
+    raise
+  finally:
+    if prewarm_thread is not None and prewarm_thread.is_alive():
+      prewarm_thread.join(timeout=10)
+    if program is not None and hasattr(program, "close"):
+      program.close()
+    if prompt_stream is not None and hasattr(prompt_stream, "close"):
+      logging.info("Closing prompt_stream (unwarming active warmpools)...")
+      try:
+        prompt_stream.close()
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning("Prompt stream close note: %s", e)
+    if fleet is not None:
+      logging.info("Tearing down SandboxFleet on orchestrator...")
+      try:
+        fleet.teardown()
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning("Fleet teardown note: %s", e)
+      try:
+        from agent_sandbox_rl import reap  # pylint: disable=g-import-not-at-top
+
+        run_id = getattr(fleet, "run_id", None)
+        if run_id:
+          for c in getattr(fleet, "registry", []):
+            c_ns = (
+                getattr(c, "namespace", None)
+                or os.getenv("SANDBOX_NAMESPACE")
+                or os.getenv("NAMESPACE", "priority-dev")
+            )
+            logging.info(
+                "Reaping agent_sandbox_rl resources for run_id=%s in namespace=%s...",
+                run_id,
+                c_ns,
+            )
+            reap(
+                run_id=run_id,
+                in_cluster=getattr(c, "in_cluster", True),
+                namespace=c_ns,
+                delete_pods=True,
+            )
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning("Reaper note: %s", e)
+    try:
+      from examples.deepswe import sandbox_utils  # pylint: disable=g-import-not-at-top
+
+      sandbox_utils.teardown_global_fleet()
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logging.warning("Global fleet teardown note: %s", e)
+    if args.stop_workers_on_exit:
+      logging.info("Shutting down cluster workers...")
+      cluster.shutdown()
+    else:
+      cluster.monitor.close()
+
+  result = program.last_step_result
+  if result is None:
+    logging.info("=== DeepSWE GRPO pipeline finished without step result ===")
+    return
+
+  logging.info(
+      "=== DeepSWE GRPO pipeline finished ===\n"
+      "  Final step: %d\n"
+      "  Final policy version: %d\n"
+      "  Rollouts in final step: %d\n"
+      "  Microbatches in final step: %d\n"
+      "  Final reward: mean=%.4f std=%.4f",
+      result.step,
+      result.policy_version,
+      result.num_rollouts,
+      result.num_microbatches,
+      result.reward_mean,
+      result.reward_std,
+  )
+
+
+if __name__ == "__main__":
+  main(sys.argv[1:])
